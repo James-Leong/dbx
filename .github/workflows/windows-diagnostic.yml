@@ -39,6 +39,8 @@ jobs:
         run: pnpm build
 
       - name: Build Windows executable
+        env:
+          CXXFLAGS: /std:c++17 /EHsc
         run: cargo build --release -p dbx --target x86_64-pc-windows-msvc
 
       - name: Package diagnostic portable ZIP
