@@ -35,13 +35,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Build frontend
-        run: pnpm build
-
       - name: Build Windows executable
         env:
           CXXFLAGS: /std:c++17 /EHsc
-        run: cargo build --release -p dbx --target x86_64-pc-windows-msvc
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle --ci
 
       - name: Package diagnostic portable ZIP
         shell: pwsh
