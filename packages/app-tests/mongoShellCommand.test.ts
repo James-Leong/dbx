@@ -533,6 +533,82 @@ test("parseMongoAggregateCommand accepts an empty pipeline", () => {
   });
 });
 
+test("parseMongoAggregateCommand ignores comments inside aggregate pipelines", () => {
+  const command = parseMongoAggregateCommand(`
+    db.cash.aggregate([
+      {
+        $match: {
+          portfolio_id: "b6f6ec62-8571-11f1-bbfb-000c29caf77f",
+          date: { $gte: "20260604" }
+        }
+      },
+      { $unwind: "$cashs" },
+      {
+        $project: {
+          _id: 0,
+          date: 1,
+          trans_currency_cd: "$cashs.trans_currency_cd",
+          cash_local: { $multiply: ["$cashs.cash", "$cashs.fx_rate"] }
+        }
+      },
+      {
+        $group: {
+          _id: { date: "$date", currency: "$trans_currency_cd" },
+          cash_local: { $sum: "$cash_local" }
+        }
+      },
+      // 第二步：按 date 分组，将不同币种转为字段
+      {
+        $group: {
+          _id: "$_id.date",
+          cny: {
+            $sum: {
+              $cond: [{ $eq: ["$_id.currency", "CNY"] }, "$cash_local", 0]
+            }
+          },
+          hkd: {
+            $sum: {
+              $cond: [{ $eq: ["$_id.currency", "HKD"] }, "$cash_local", 0]
+            }
+          },
+          total_cash: { $sum: "$cash_local" }
+        }
+      },
+      { $sort: { _id: 1 } },
+      /* 可选：将 _id 重命名为 date */
+      {
+        $project: {
+          _id: 0,
+          date: "$_id",
+          cny: 1,
+          hkd: 1,
+          total_cash: 1
+        }
+      }
+    ])
+  `);
+
+  assert.ok(command);
+  assert.equal(command.collection, "cash");
+  const pipeline = JSON.parse(command.pipeline);
+  assert.equal(pipeline.length, 7);
+  assert.deepEqual(pipeline[4].$group.total_cash, { $sum: "$cash_local" });
+});
+
+test("parseMongoAggregateCommand keeps comment markers inside string values", () => {
+  const command = parseMongoAggregateCommand(`db.logs.aggregate([
+    { $match: { url: "https://example.com/a//b", note: "literal /* text */" } },
+    // comment with closing delimiters )]}
+    { $project: { url: 1, note: 1 } }
+  ])`);
+
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.pipeline)[0].$match, {
+    url: "https://example.com/a//b",
+    note: "literal /* text */",
+  });
+});
+
 test("parseMongoAggregateCommand accepts official aggregate options document", () => {
   assert.deepEqual(parseMongoAggregateCommand("db.products.aggregate([], {})"), {
     collection: "products",

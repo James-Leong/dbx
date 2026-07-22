@@ -7,9 +7,11 @@
 export function normalizeJsonArgument(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed) return "{}";
+  const withoutComments = stripMongoJsonComments(trimmed).trim();
+  if (!withoutComments) return "{}";
   // Rewrite mongo shell constructors that are not valid JSON into extended JSON
   // (mongo_driver::json_value_to_bson): ObjectId / NumberLong / ISODate / new Date.
-  const withExtendedJson = replaceMongoShellConstructors(trimmed);
+  const withExtendedJson = replaceMongoShellConstructors(withoutComments);
   const preprocessed = quoteUnquotedObjectKeys(convertSingleQuotedStrings(withExtendedJson));
   try {
     JSON.parse(preprocessed);
@@ -78,6 +80,12 @@ export function splitTopLevel(source: string): string[] {
       continue;
     }
 
+    const commentEnd = mongoCommentEndAt(source, i);
+    if (commentEnd !== null) {
+      i = commentEnd - 1;
+      continue;
+    }
+
     if (char === '"' || char === "'") quote = char;
     else if (char === "{" || char === "[" || char === "(") depth += 1;
     else if (char === "}" || char === "]" || char === ")") depth -= 1;
@@ -106,6 +114,12 @@ export function findMatchingParen(source: string, openIndex: number): number {
       continue;
     }
 
+    const commentEnd = mongoCommentEndAt(source, i);
+    if (commentEnd !== null) {
+      i = commentEnd - 1;
+      continue;
+    }
+
     if (char === '"' || char === "'") quote = char;
     else if (char === "(") depth += 1;
     else if (char === ")") {
@@ -130,6 +144,11 @@ export function hasUnclosedMongoDelimiters(source: string): boolean {
       else if (char === quote) quote = null;
       continue;
     }
+    const commentEnd = mongoCommentEndAt(source, i);
+    if (commentEnd !== null) {
+      i = commentEnd - 1;
+      continue;
+    }
     if (char === '"' || char === "'") {
       quote = char;
       continue;
@@ -144,6 +163,41 @@ export function hasUnclosedMongoDelimiters(source: string): boolean {
     }
   }
   return quote !== null || stack.length > 0;
+}
+
+/** Remove shell/SQL-style comments from JSON-like Mongo arguments. */
+export function stripMongoJsonComments(source: string): string {
+  let result = "";
+  let quote: string | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i] ?? "";
+    if (quote) {
+      result += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      result += char;
+      continue;
+    }
+
+    const commentEnd = mongoCommentEndAt(source, i);
+    if (commentEnd !== null) {
+      result += source.slice(i, commentEnd).replace(/[^\n\r]/g, " ");
+      i = commentEnd - 1;
+      continue;
+    }
+
+    result += char;
+  }
+
+  return result;
 }
 
 /** Strip leading line/block comments (//, --, and block comments). */
@@ -164,6 +218,20 @@ export function trimMongoOuterComments(source: string): string {
     }
     return trimmed.trimEnd();
   }
+}
+
+function mongoCommentEndAt(source: string, index: number): number | null {
+  const current = source[index];
+  const next = source[index + 1];
+  if ((current === "/" && next === "/") || (current === "-" && next === "-")) {
+    const lineFeed = source.indexOf("\n", index + 2);
+    return lineFeed < 0 ? source.length : lineFeed + 1;
+  }
+  if (current === "/" && next === "*") {
+    const end = source.indexOf("*/", index + 2);
+    return end < 0 ? source.length : end + 2;
+  }
+  return null;
 }
 
 export function quoteUnquotedObjectKeys(source: string): string {
