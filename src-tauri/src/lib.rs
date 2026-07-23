@@ -19,9 +19,30 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 const DESKTOP_TRAY_ID: &str = "main-tray";
+#[cfg(target_os = "windows")]
+const WEBVIEW2_NO_SANDBOX_ENV: &str = "DBX_WEBVIEW2_NO_SANDBOX";
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
 const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
+
+#[cfg(target_os = "windows")]
+fn configure_webview2_sandbox_compat() {
+    if !matches!(std::env::var(WEBVIEW2_NO_SANDBOX_ENV).as_deref(), Ok("1")) {
+        return;
+    }
+
+    let mut args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+    if !args.split_whitespace().any(|arg| arg == "--no-sandbox") {
+        if !args.is_empty() {
+            args.push(' ');
+        }
+        args.push_str("--no-sandbox");
+    }
+    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_webview2_sandbox_compat() {}
 
 pub(crate) fn apply_debug_log_level(debug_logging_enabled: bool) {
     log::set_max_level(if debug_logging_enabled { log::LevelFilter::Debug } else { log::LevelFilter::Off });
@@ -233,6 +254,8 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    configure_webview2_sandbox_compat();
+
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
 
     let startup_begin = Instant::now();
