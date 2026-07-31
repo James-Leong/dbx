@@ -2,12 +2,14 @@
 node_modules/
 .claude/
 .codex/
+.workbuddy/
 .superpowers/
 .trellis/
 .worktrees/
 openspec/
 .mcp.json
 AGENTS.md
+CLAUDE.md
 
 # Build output
 dist/
@@ -48,15 +50,24 @@ Thumbs.db
 # Temp
 tmp/
 
+# Code review tool artifacts
+review_diff.json
+review_classified.json
+
 # Logs
 *.log
 
-# Agent JDBC driver JARs
-agents/*/libs/*.jar
 
 # Generated changelog data
 releases-*.json
+latest-en.json
 
 test.pdb
 portable/
 DBX_*_x64-portable.zip
+.agents/skills
+.pnpm-store/*
+.dbx-web
+# Local devtest connections (contains credentials; do not commit)
+dbx-devtest-connections.json
+.npmrc

@@ -145,6 +145,8 @@ pub async fn get_columns(client: &RqliteClient, _schema: &str, table: &str) -> R
             numeric_precision: None,
             numeric_scale: None,
             character_maximum_length: None,
+            enum_values: None,
+            ..Default::default()
         })
         .collect())
 }
@@ -198,6 +200,8 @@ pub async fn list_foreign_keys(
             ref_schema: None,
             ref_table: value_by_column(&result.columns, &row, "table").unwrap_or_default(),
             ref_column: value_by_column(&result.columns, &row, "to").unwrap_or_default(),
+            on_update: None,
+            on_delete: None,
         })
         .collect())
 }
@@ -234,6 +238,7 @@ pub async fn list_triggers(client: &RqliteClient, _schema: &str, table: &str) ->
                 name: value_as_string(row.first()).unwrap_or_default(),
                 event: event.to_string(),
                 timing: timing.to_string(),
+                statement: value_as_string(row.get(1)),
             }
         })
         .collect())
@@ -269,7 +274,7 @@ pub async fn object_source(
         )
         .await?,
     )?;
-    Ok(ObjectSource { name: name.to_string(), object_type: object_type.clone(), schema: None, source })
+    Ok(ObjectSource { name: name.to_string(), object_type: object_type.clone(), schema: None, source, editable: None })
 }
 
 pub async fn execute_query(client: &RqliteClient, sql: &str) -> Result<QueryResult, String> {
@@ -292,12 +297,15 @@ pub async fn execute_query_with_max_rows(
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
         })
     }
 }
@@ -341,12 +349,15 @@ fn query_result_from_rqlite_result(
         columns: result.columns,
         column_types: Vec::new(),
         column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
         rows: result.values,
         affected_rows: 0,
         execution_time_ms,
         truncated,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
     }
 }
 

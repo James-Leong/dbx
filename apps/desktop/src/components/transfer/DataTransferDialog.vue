@@ -1,27 +1,41 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { uuid } from "@/lib/utils";
+import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import SearchableSelect from "@/components/ui/searchable-select/SearchableSelect.vue";
+import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
-import * as api from "@/lib/api";
-import type { TransferProgress, TransferMode } from "@/lib/api";
+import { connectionIconType } from "@/lib/connection/connectionPresentation";
+import * as api from "@/lib/backend/api";
+import type { TransferMode, TransferTableNameCase } from "@/lib/backend/api";
 import type { DatabaseType } from "@/types/database";
-import { isSchemaAware, supportsTransfer } from "@/lib/databaseCapabilities";
-import { nextTransferTerminalState } from "@/lib/transferProgressState";
-import { ArrowRightLeft, Check, X, Loader2, Square, CheckSquare } from "@lucide/vue";
+import { isSchemaAware, supportsTransfer } from "@/lib/database/databaseCapabilities";
+import { isDorisFamilyCatalogCapable } from "@/lib/database/databaseFeatureSupport";
+import { isSameTransferDatabase, normalizeTransferCatalog } from "@/lib/database/dataTransferSelection";
+import { databaseOptionsForConnection, fetchCatalogNamespaceOptions, fetchNamespaceOptionsForConnection, namespaceOptionsAreSchemas } from "@/composables/useDatabaseOptions";
+import { useExportTracker } from "@/composables/useExportTracker";
+import type { CatalogInfo } from "@/types/database";
+import { ArrowRightLeft, ArrowLeftRight, Loader2, Square, CheckSquare } from "@lucide/vue";
 
 const { t } = useI18n();
+const { startDataTransferTask } = useExportTracker();
 const open = defineModel<boolean>("open", { default: false });
 
 const props = defineProps<{
   prefillConnectionId?: string;
   prefillDatabase?: string;
+  prefillCatalog?: string;
+  prefillSchema?: string;
+  prefillTables?: string[];
+  prefillTargetConnectionId?: string;
+  prefillTargetDatabase?: string;
+  prefillTargetSchema?: string;
 }>();
 
 const store = useConnectionStore();
@@ -30,6 +44,8 @@ const sqlConnections = computed(() => store.connections.filter((c) => supportsTr
 
 // Source state
 const sourceConnectionId = ref("");
+const sourceCatalog = ref("");
+const sourceCatalogs = ref<CatalogInfo[]>([]);
 const sourceDatabase = ref("");
 const sourceDatabases = ref<string[]>([]);
 const sourceSchemas = ref<string[]>([]);
@@ -38,36 +54,37 @@ const sourceTables = ref<string[]>([]);
 const selectedTables = ref<Set<string>>(new Set());
 const tableSearch = ref("");
 const loadingTables = ref(false);
+const pendingSourceSchemaPrefill = ref("");
+const pendingSelectedTablesPrefill = ref<string[] | null>(null);
 
 // Target state
 const targetConnectionId = ref("");
+const targetCatalog = ref("");
+const targetCatalogs = ref<CatalogInfo[]>([]);
 const targetDatabase = ref("");
 const targetDatabases = ref<string[]>([]);
 const targetSchemas = ref<string[]>([]);
 const targetSchema = ref("");
+const pendingTargetSchemaPrefill = ref("");
 
 // Options
 const createTable = ref(true);
 const transferMode = ref<TransferMode>("append");
+const targetTableNameCase = ref<TransferTableNameCase>("preserve");
 const batchSize = ref(1000);
-
-// Transfer state
-const isTransferring = ref(false);
-const transferProgress = ref<Map<string, TransferProgress>>(new Map());
-const currentTable = ref("");
-const overallDone = ref(false);
-const overallError = ref(false);
-const overallCancelled = ref(false);
-const transferId = ref("");
+const isSubmitting = ref(false);
+const ownershipDialogOpen = ref(false);
+const ownershipMissingOwners = ref<string[]>([]);
+const ownershipTargetOwner = ref("");
+const pendingOwnershipRequest = ref<api.TransferRequest | null>(null);
+const pendingOwnershipRefresh = ref<{ shouldRefreshTargetTree: boolean } | null>(null);
 
 const filteredTables = computed(() => {
   const q = tableSearch.value.toLowerCase();
   return q ? sourceTables.value.filter((t) => t.toLowerCase().includes(q)) : sourceTables.value;
 });
 
-const allSelected = computed(
-  () => filteredTables.value.length > 0 && filteredTables.value.every((t) => selectedTables.value.has(t)),
-);
+const allSelected = computed(() => filteredTables.value.length > 0 && filteredTables.value.every((t) => selectedTables.value.has(t)));
 
 function connectionType(id: string): DatabaseType | undefined {
   return store.connections.find((c) => c.id === id)?.db_type;
@@ -77,15 +94,23 @@ function isMongoConnection(id: string): boolean {
   return connectionType(id) === "mongodb";
 }
 
-const canStart = computed(
-  () =>
-    sourceConnectionId.value &&
-    sourceDatabase.value &&
-    targetConnectionId.value &&
-    targetDatabase.value &&
-    selectedTables.value.size > 0 &&
-    sourceConnectionId.value + sourceDatabase.value !== targetConnectionId.value + targetDatabase.value,
-);
+function isCatalogCapable(id: string): boolean {
+  const config = store.getConfig(id);
+  return isDorisFamilyCatalogCapable(config?.db_type, config?.driver_profile);
+}
+
+const canStart = computed(() => {
+  const effectiveSourceSchema = sourceSchema.value || sourceDatabase.value;
+  const effectiveTargetSchema = targetSchema.value || targetDatabase.value;
+  const sameCatalogAndDatabase = isSameTransferDatabase(
+    { connectionId: sourceConnectionId.value, catalog: sourceCatalog.value, catalogs: sourceCatalogs.value, database: sourceDatabase.value },
+    { connectionId: targetConnectionId.value, catalog: targetCatalog.value, catalogs: targetCatalogs.value, database: targetDatabase.value },
+  );
+  const sameSourceAndTarget = sameCatalogAndDatabase && effectiveSourceSchema === effectiveTargetSchema;
+  return (
+    !!sourceConnectionId.value && !!sourceDatabase.value && !!targetConnectionId.value && !!targetDatabase.value && (sourceCatalogs.value.length <= 1 || !!sourceCatalog.value) && (targetCatalogs.value.length <= 1 || !!targetCatalog.value) && selectedTables.value.size > 0 && !sameSourceAndTarget
+  );
+});
 
 function toggleSelectAll() {
   if (allSelected.value) {
@@ -103,13 +128,64 @@ function toggleTable(table: string) {
   }
 }
 
+async function loadCatalogs(connectionId: string, side: "source" | "target") {
+  if (!connectionId || !isCatalogCapable(connectionId)) {
+    if (side === "source") {
+      sourceCatalogs.value = [];
+      sourceCatalog.value = "";
+    } else {
+      targetCatalogs.value = [];
+      targetCatalog.value = "";
+    }
+    return;
+  }
+  try {
+    const catalogs = await api.listDorisCatalogs(connectionId);
+    if (side === "source") {
+      sourceCatalogs.value = catalogs;
+      sourceCatalog.value = catalogs.length === 1 ? catalogs[0].name : "";
+    } else {
+      targetCatalogs.value = catalogs;
+      targetCatalog.value = catalogs.length === 1 ? catalogs[0].name : "";
+    }
+  } catch {
+    if (side === "source") {
+      sourceCatalogs.value = [];
+      sourceCatalog.value = "";
+    } else {
+      targetCatalogs.value = [];
+      targetCatalog.value = "";
+    }
+  }
+}
+
 async function loadDatabases(connectionId: string, target: "source" | "target") {
   if (!connectionId) return;
   try {
     await store.ensureConnected(connectionId);
-    const names = isMongoConnection(connectionId)
-      ? await api.mongoListDatabases(connectionId)
-      : (await api.listDatabases(connectionId)).map((d) => d.name);
+    const config = store.getConfig(connectionId);
+    if (!config) return;
+    const names = isMongoConnection(connectionId) ? databaseOptionsForConnection(await api.mongoListDatabases(connectionId), config) : await fetchNamespaceOptionsForConnection(connectionId, config);
+    if (target === "source") {
+      sourceDatabases.value = names;
+      sourceDatabase.value = names.length === 1 ? names[0] : "";
+    } else {
+      targetDatabases.value = names;
+      targetDatabase.value = names.length === 1 ? names[0] : "";
+    }
+  } catch {
+    if (target === "source") sourceDatabases.value = [];
+    else targetDatabases.value = [];
+  }
+}
+
+async function loadDatabasesForCatalog(connectionId: string, catalog: string, target: "source" | "target") {
+  if (!connectionId || !catalog) return;
+  try {
+    await store.ensureConnected(connectionId);
+    const config = store.getConfig(connectionId);
+    if (!config) return;
+    const names = await fetchCatalogNamespaceOptions(connectionId, catalog, config);
     if (target === "source") {
       sourceDatabases.value = names;
       sourceDatabase.value = names.length === 1 ? names[0] : "";
@@ -137,12 +213,7 @@ async function loadSchemas(connectionId: string, database: string, side: "source
   }
   try {
     const schemas = await api.listSchemas(connectionId, database);
-    const selected =
-      preferredSchema && schemas.includes(preferredSchema)
-        ? preferredSchema
-        : schemas.includes("public")
-          ? "public"
-          : (schemas[0] ?? "");
+    const selected = preferredSchema && schemas.includes(preferredSchema) ? preferredSchema : schemas.includes("public") ? "public" : (schemas[0] ?? "");
     if (side === "source") {
       sourceSchemas.value = schemas;
       sourceSchema.value = selected;
@@ -161,6 +232,12 @@ async function loadSchemas(connectionId: string, database: string, side: "source
   }
 }
 
+function applyPendingTableSelection() {
+  const pending = pendingSelectedTablesPrefill.value;
+  selectedTables.value = pending ? new Set(sourceTables.value.filter((table) => pending.includes(table))) : new Set(sourceTables.value);
+  pendingSelectedTablesPrefill.value = null;
+}
+
 async function loadTables() {
   if (!sourceConnectionId.value || !sourceDatabase.value) {
     sourceTables.value = [];
@@ -169,18 +246,17 @@ async function loadTables() {
   loadingTables.value = true;
   try {
     if (isMongoConnection(sourceConnectionId.value)) {
-      sourceTables.value = await api.mongoListCollections(sourceConnectionId.value, sourceDatabase.value);
-      selectedTables.value = new Set(sourceTables.value);
+      sourceTables.value = (await api.mongoListCollections(sourceConnectionId.value, sourceDatabase.value)).map((c) => c.name);
+      applyPendingTableSelection();
       return;
     }
     const config = store.getConfig(sourceConnectionId.value);
     const needsSchema = isSchemaAware(config?.db_type);
     const schema = needsSchema && sourceSchema.value ? sourceSchema.value : sourceDatabase.value;
-    const tables = await api.listTables(sourceConnectionId.value, sourceDatabase.value, schema);
-    sourceTables.value = tables
-      .filter((t) => t.table_type === "TABLE" || t.table_type === "BASE TABLE")
-      .map((t) => t.name);
-    selectedTables.value = new Set(sourceTables.value);
+    const catalog = sourceCatalog.value || undefined;
+    const tables = await api.listTables(sourceConnectionId.value, sourceDatabase.value, schema, undefined, undefined, undefined, undefined, catalog);
+    sourceTables.value = tables.filter((t) => t.table_type === "TABLE" || t.table_type === "BASE TABLE").map((t) => t.name);
+    applyPendingTableSelection();
   } catch {
     sourceTables.value = [];
   } finally {
@@ -189,23 +265,51 @@ async function loadTables() {
 }
 
 const skipSourceWatch = ref(false);
+const skipTargetWatch = ref(false);
 
-watch(sourceConnectionId, (id) => {
+watch(sourceConnectionId, async (id) => {
   if (skipSourceWatch.value) {
     skipSourceWatch.value = false;
     return;
   }
+  sourceCatalog.value = "";
+  sourceCatalogs.value = [];
   sourceDatabase.value = "";
   sourceTables.value = [];
   selectedTables.value.clear();
-  loadDatabases(id, "source");
+  pendingSourceSchemaPrefill.value = "";
+  pendingSelectedTablesPrefill.value = null;
+  if (isCatalogCapable(id)) {
+    await loadCatalogs(id, "source");
+    if (sourceCatalog.value) {
+      await loadDatabasesForCatalog(id, sourceCatalog.value, "source");
+    }
+  } else {
+    await loadDatabases(id, "source");
+  }
+});
+
+watch(sourceCatalog, async (catalog) => {
+  if (!sourceConnectionId.value) return;
+  sourceDatabase.value = "";
+  sourceTables.value = [];
+  selectedTables.value.clear();
+  if (catalog) {
+    await loadDatabasesForCatalog(sourceConnectionId.value, catalog, "source");
+  }
 });
 
 watch(sourceDatabase, async (db) => {
   if (db) {
     const config = store.getConfig(sourceConnectionId.value);
-    if (isSchemaAware(config?.db_type)) {
-      await loadSchemas(sourceConnectionId.value, db, "source");
+    if (namespaceOptionsAreSchemas(config)) {
+      // Dameng has no selectable catalog, so the top-level namespace option is
+      // also the schema used for metadata lookup and qualified transfer SQL.
+      sourceSchemas.value = [];
+      sourceSchema.value = db;
+    } else if (isSchemaAware(config?.db_type)) {
+      await loadSchemas(sourceConnectionId.value, db, "source", pendingSourceSchemaPrefill.value);
+      pendingSourceSchemaPrefill.value = "";
     } else {
       sourceSchema.value = db;
     }
@@ -214,18 +318,46 @@ watch(sourceDatabase, async (db) => {
 
 watch(sourceSchema, () => loadTables());
 
-watch(targetConnectionId, (id) => {
+watch(targetConnectionId, async (id) => {
+  if (skipTargetWatch.value) {
+    skipTargetWatch.value = false;
+    return;
+  }
+  targetCatalog.value = "";
+  targetCatalogs.value = [];
   targetDatabase.value = "";
   targetSchemas.value = [];
   targetSchema.value = "";
-  loadDatabases(id, "target");
+  pendingTargetSchemaPrefill.value = "";
+  if (isCatalogCapable(id)) {
+    await loadCatalogs(id, "target");
+    if (targetCatalog.value) {
+      await loadDatabasesForCatalog(id, targetCatalog.value, "target");
+    }
+  } else {
+    await loadDatabases(id, "target");
+  }
+});
+
+watch(targetCatalog, async (catalog) => {
+  if (!targetConnectionId.value) return;
+  targetDatabase.value = "";
+  targetSchemas.value = [];
+  targetSchema.value = "";
+  if (catalog) {
+    await loadDatabasesForCatalog(targetConnectionId.value, catalog, "target");
+  }
 });
 
 watch(targetDatabase, async (db) => {
   if (db) {
     const config = store.getConfig(targetConnectionId.value);
-    if (isSchemaAware(config?.db_type)) {
-      await loadSchemas(targetConnectionId.value, db, "target");
+    if (namespaceOptionsAreSchemas(config)) {
+      targetSchemas.value = [];
+      targetSchema.value = db;
+    } else if (isSchemaAware(config?.db_type)) {
+      await loadSchemas(targetConnectionId.value, db, "target", pendingTargetSchemaPrefill.value);
+      pendingTargetSchemaPrefill.value = "";
     } else {
       targetSchema.value = db;
     }
@@ -237,13 +369,37 @@ watch(
   async (val) => {
     if (val) {
       resetState();
+      pendingSourceSchemaPrefill.value = props.prefillSchema ?? "";
+      pendingSelectedTablesPrefill.value = props.prefillTables?.length ? [...props.prefillTables] : null;
+      pendingTargetSchemaPrefill.value = props.prefillTargetSchema ?? "";
       if (props.prefillConnectionId) {
         skipSourceWatch.value = true;
         sourceConnectionId.value = props.prefillConnectionId;
-        await loadDatabases(props.prefillConnectionId, "source");
-        if (props.prefillDatabase) {
-          sourceDatabase.value = props.prefillDatabase;
+        if (isCatalogCapable(props.prefillConnectionId)) {
+          await loadCatalogs(props.prefillConnectionId, "source");
+          if (props.prefillCatalog) {
+            sourceCatalog.value = props.prefillCatalog;
+          }
+          if (sourceCatalog.value) {
+            await loadDatabasesForCatalog(props.prefillConnectionId, sourceCatalog.value, "source");
+          }
+        } else {
+          await loadDatabases(props.prefillConnectionId, "source");
         }
+        if (props.prefillDatabase) sourceDatabase.value = props.prefillDatabase;
+      }
+      if (props.prefillTargetConnectionId) {
+        skipTargetWatch.value = true;
+        targetConnectionId.value = props.prefillTargetConnectionId;
+        if (isCatalogCapable(props.prefillTargetConnectionId)) {
+          await loadCatalogs(props.prefillTargetConnectionId, "target");
+          if (targetCatalog.value) {
+            await loadDatabasesForCatalog(props.prefillTargetConnectionId, targetCatalog.value, "target");
+          }
+        } else {
+          await loadDatabases(props.prefillTargetConnectionId, "target");
+        }
+        if (props.prefillTargetDatabase) targetDatabase.value = props.prefillTargetDatabase;
       }
     }
   },
@@ -252,299 +408,317 @@ watch(
 
 function resetState() {
   sourceConnectionId.value = "";
+  sourceCatalog.value = "";
+  sourceCatalogs.value = [];
   sourceDatabase.value = "";
   sourceDatabases.value = [];
   sourceSchemas.value = [];
   sourceSchema.value = "";
   sourceTables.value = [];
   selectedTables.value.clear();
+  pendingSourceSchemaPrefill.value = "";
+  pendingSelectedTablesPrefill.value = null;
   tableSearch.value = "";
   targetConnectionId.value = "";
+  targetCatalog.value = "";
+  targetCatalogs.value = [];
   targetDatabase.value = "";
   targetDatabases.value = [];
   targetSchemas.value = [];
   targetSchema.value = "";
+  pendingTargetSchemaPrefill.value = "";
   createTable.value = true;
   transferMode.value = "append";
+  targetTableNameCase.value = "preserve";
   batchSize.value = 1000;
-  isTransferring.value = false;
-  transferProgress.value.clear();
-  currentTable.value = "";
-  overallDone.value = false;
-  overallError.value = false;
-  overallCancelled.value = false;
+  isSubmitting.value = false;
+  ownershipDialogOpen.value = false;
+  ownershipMissingOwners.value = [];
+  ownershipTargetOwner.value = "";
+  pendingOwnershipRequest.value = null;
+  pendingOwnershipRefresh.value = null;
 }
 
 async function startTransfer() {
-  isTransferring.value = true;
-  overallDone.value = false;
-  overallError.value = false;
-  overallCancelled.value = false;
-  transferProgress.value.clear();
-
-  transferId.value = uuid();
+  if (!canStart.value || isSubmitting.value) return;
+  isSubmitting.value = true;
 
   const effectiveSourceSchema = sourceSchema.value || sourceDatabase.value;
   const effectiveTargetSchema = targetSchema.value || targetDatabase.value;
+  const sourceDatabaseName = sourceDatabase.value;
+  const targetConnection = targetConnectionId.value;
+  const targetDatabaseName = targetDatabase.value;
+  const shouldRefreshTargetTree = createTable.value;
 
   const request: api.TransferRequest = {
-    transferId: transferId.value,
+    transferId: uuid(),
     sourceConnectionId: sourceConnectionId.value,
-    sourceDatabase: sourceDatabase.value,
+    sourceDatabase: sourceDatabaseName,
     sourceSchema: effectiveSourceSchema,
-    targetConnectionId: targetConnectionId.value,
-    targetDatabase: targetDatabase.value,
+    sourceCatalog: normalizeTransferCatalog(sourceCatalog.value, sourceCatalogs.value) || undefined,
+    targetConnectionId: targetConnection,
+    targetDatabase: targetDatabaseName,
     targetSchema: effectiveTargetSchema,
+    targetCatalog: normalizeTransferCatalog(targetCatalog.value, targetCatalogs.value) || undefined,
     tables: [...selectedTables.value],
     createTable: createTable.value,
     mode: transferMode.value,
+    targetTableNameCase: targetTableNameCase.value,
+    ownershipPolicy: "preserve",
     batchSize: batchSize.value,
   };
 
-  try {
-    await api.startTransfer(request, (progress) => {
-      if (progress.table) {
-        transferProgress.value.set(progress.table, progress);
-        transferProgress.value = new Map(transferProgress.value);
-        currentTable.value = progress.table;
+  if (createTable.value) {
+    try {
+      const preview = await api.previewTransferOwnership(request);
+      if (preview.missingOwners.length > 0) {
+        ownershipMissingOwners.value = preview.missingOwners;
+        ownershipTargetOwner.value = preview.targetOwner;
+        pendingOwnershipRequest.value = request;
+        pendingOwnershipRefresh.value = {
+          shouldRefreshTargetTree,
+        };
+        ownershipDialogOpen.value = true;
+        isSubmitting.value = false;
+        return;
       }
-
-      const nextState = nextTransferTerminalState(
-        {
-          done: overallDone.value,
-          cancelled: overallCancelled.value,
-          error: overallError.value,
-        },
-        progress,
-      );
-      overallDone.value = nextState.done;
-      overallCancelled.value = nextState.cancelled;
-      overallError.value = nextState.error;
-    });
-    if (createTable.value && !overallError.value && !overallCancelled.value) {
-      await store.refreshObjectListTreeNode(targetConnectionId.value, targetDatabase.value, targetSchema.value);
+    } catch {
+      isSubmitting.value = false;
+      return;
     }
-  } catch (e: any) {
-    overallError.value = true;
   }
+
+  runTransfer(request, shouldRefreshTargetTree);
 }
 
-async function cancelTransfer() {
-  if (transferId.value) {
-    await api.cancelTransfer(transferId.value);
+function runTransfer(request: api.TransferRequest, shouldRefreshTargetTree: boolean) {
+  isSubmitting.value = true;
+  startDataTransferTask(request, `${request.sourceDatabase} → ${request.targetDatabase}`, {
+    formatOverlapError: (tables) => t("transfer.targetTableBusy", { tables: tables.join(", ") }),
+    onDone: async () => {
+      if (shouldRefreshTargetTree) {
+        await store.refreshObjectListTreeNode(request.targetConnectionId, request.targetDatabase, request.targetSchema, request.targetCatalog);
+      }
+    },
+  });
+  open.value = false;
+  resetState();
+}
+
+function resolveOwnershipDecision(policy: api.TransferOwnershipPolicy | null) {
+  const request = pendingOwnershipRequest.value;
+  const refresh = pendingOwnershipRefresh.value;
+  pendingOwnershipRequest.value = null;
+  pendingOwnershipRefresh.value = null;
+  ownershipDialogOpen.value = false;
+  ownershipMissingOwners.value = [];
+  ownershipTargetOwner.value = "";
+  if (!policy || !request || !refresh) {
+    isSubmitting.value = false;
+    return;
   }
+  runTransfer({ ...request, ownershipPolicy: policy }, refresh.shouldRefreshTargetTree);
 }
 
 function getConnectionName(id: string) {
   return store.connections.find((c) => c.id === id)?.name ?? id;
 }
-
-function getConnectionType(id: string): DatabaseType {
-  return store.connections.find((c) => c.id === id)?.db_type ?? "mysql";
-}
-
-const processedStatuses = new Set<TransferProgress["status"]>(["tableDone", "done", "error", "cancelled"]);
-
-function formatRowCount(count: number) {
-  return count.toLocaleString();
-}
-
-function formatTableRows(progress: TransferProgress) {
-  if (typeof progress.totalRows === "number") {
-    return `${formatRowCount(progress.rowsTransferred)} / ${formatRowCount(progress.totalRows)}`;
-  }
-  return formatRowCount(progress.rowsTransferred);
-}
-
-const completedTables = computed(
-  () => [...transferProgress.value.values()].filter((p) => processedStatuses.has(p.status)).length,
-);
-
-const failedTables = computed(() => [...transferProgress.value.values()].filter((p) => p.status === "error").length);
-
-const totalTransferred = computed(() =>
-  [...transferProgress.value.values()].reduce((sum, p) => sum + p.rowsTransferred, 0),
-);
-
-const knownTotalRows = computed(() =>
-  [...transferProgress.value.values()].reduce((sum, p) => sum + (typeof p.totalRows === "number" ? p.totalRows : 0), 0),
-);
-
-const overallRowsLabel = computed(() =>
-  knownTotalRows.value > 0
-    ? `${formatRowCount(totalTransferred.value)} / ${formatRowCount(knownTotalRows.value)}`
-    : formatRowCount(totalTransferred.value),
-);
 </script>
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent class="sm:max-w-[560px] max-h-[80vh] flex flex-col overflow-hidden" @interact-outside.prevent>
-      <DialogHeader>
+    <DialogContent class="sm:max-w-[780px] max-h-[80vh] flex flex-col overflow-hidden" @interact-outside.prevent>
+      <DialogHeader class="shrink-0">
         <DialogTitle class="flex items-center gap-2">
           <ArrowRightLeft class="w-4 h-4" />
           {{ t("transfer.title") }}
         </DialogTitle>
       </DialogHeader>
 
-      <div class="flex-1 min-h-0 overflow-auto">
-        <!-- Config View -->
-        <div v-if="!isTransferring" class="grid gap-4 py-3">
-          <!-- Source Section -->
-          <div class="space-y-3">
-            <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              {{ t("transfer.source") }}
-            </div>
+      <div class="min-h-0 flex-1 overflow-hidden">
+        <div class="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] gap-4 py-3">
+          <!-- Source / Target Side by Side -->
+          <div class="grid grid-cols-[1fr_auto_1fr] gap-4 items-start">
+            <!-- Source Section -->
+            <div class="space-y-3">
+              <div class="text-sm font-medium text-blue-500">
+                {{ t("transfer.source") }}
+              </div>
 
-            <div class="grid grid-cols-2 gap-3">
               <div class="space-y-1.5">
                 <Label class="text-xs">{{ t("transfer.sourceConnection") }}</Label>
-                <Select v-model="sourceConnectionId">
-                  <SelectTrigger class="h-8 text-xs">
-                    <div v-if="sourceConnectionId" class="flex items-center gap-1.5">
-                      <DatabaseIcon :db-type="getConnectionType(sourceConnectionId)" class="w-3.5 h-3.5" />
-                      <span class="truncate">{{ getConnectionName(sourceConnectionId) }}</span>
+                <SearchableSelect
+                  v-model="sourceConnectionId"
+                  :options="sqlConnections.map((c) => c.id)"
+                  :placeholder="t('transfer.selectConnection')"
+                  :search-placeholder="t('transfer.searchConnection')"
+                  :empty-text="t('common.noResults')"
+                  :display-name="getConnectionName"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                >
+                  <template #option-label="{ option, label }">
+                    <div class="flex min-w-0 items-center gap-1.5">
+                      <DatabaseIcon :db-type="connectionIconType(sqlConnections.find((c) => c.id === option))" class="h-3.5 w-3.5 shrink-0" />
+                      <ConnectionGroupBadge :connection-id="option" />
+                      <span class="min-w-0 flex-1 truncate">{{ label }}</span>
                     </div>
-                    <SelectValue v-else />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem v-for="c in sqlConnections" :key="c.id" :value="c.id">
-                      <div class="flex items-center gap-1.5">
-                        <DatabaseIcon :db-type="c.db_type" class="w-3.5 h-3.5" />
-                        {{ c.name }}
-                      </div>
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
+                  </template>
+                </SearchableSelect>
+              </div>
+
+              <!-- Source Catalog (Doris/StarRocks multi-catalog) -->
+              <div v-if="sourceCatalogs.length > 1" class="space-y-1.5">
+                <Label class="text-xs">{{ t("transfer.sourceCatalog") }}</Label>
+                <SearchableSelect
+                  v-model="sourceCatalog"
+                  :options="sourceCatalogs.map((c) => c.name)"
+                  :placeholder="t('transfer.selectCatalog')"
+                  :search-placeholder="t('transfer.searchCatalog')"
+                  :empty-text="t('common.noResults')"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                />
               </div>
 
               <div class="space-y-1.5">
                 <Label class="text-xs">{{ t("transfer.sourceDatabase") }}</Label>
-                <Select v-model="sourceDatabase" :disabled="!sourceDatabases.length">
-                  <SelectTrigger class="h-8 text-xs">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem v-for="db in sourceDatabases" :key="db" :value="db">{{ db }}</SelectItem>
-                  </SelectContent>
-                </Select>
+                <SearchableSelect
+                  v-model="sourceDatabase"
+                  :options="sourceDatabases"
+                  :placeholder="t('transfer.selectDatabase')"
+                  :search-placeholder="t('transfer.searchDatabase')"
+                  :empty-text="t('common.noResults')"
+                  :disabled="!sourceDatabases.length"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                />
+              </div>
+
+              <div v-if="sourceSchemas.length" class="space-y-1.5">
+                <Label class="text-xs">{{ t("transfer.sourceSchema") }}</Label>
+                <SearchableSelect
+                  v-model="sourceSchema"
+                  :options="sourceSchemas"
+                  :placeholder="t('transfer.selectSchema')"
+                  :search-placeholder="t('transfer.searchSchema')"
+                  :empty-text="t('common.noResults')"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                />
               </div>
             </div>
 
-            <div v-if="sourceSchemas.length" class="space-y-1.5">
-              <Label class="text-xs">{{ t("transfer.sourceSchema") }}</Label>
-              <Select v-model="sourceSchema">
-                <SelectTrigger class="h-8 text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem v-for="schema in sourceSchemas" :key="schema" :value="schema">{{ schema }}</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <!-- Target Section -->
-          <div class="space-y-3">
-            <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              {{ t("transfer.target") }}
+            <!-- Arrow -->
+            <div class="flex items-center pt-8">
+              <ArrowLeftRight class="w-5 h-5 text-muted-foreground" />
             </div>
 
-            <div class="grid grid-cols-2 gap-3">
+            <!-- Target Section -->
+            <div class="space-y-3">
+              <div class="text-sm font-medium text-green-500">
+                {{ t("transfer.target") }}
+              </div>
+
               <div class="space-y-1.5">
                 <Label class="text-xs">{{ t("transfer.targetConnection") }}</Label>
-                <Select v-model="targetConnectionId">
-                  <SelectTrigger class="h-8 text-xs">
-                    <div v-if="targetConnectionId" class="flex items-center gap-1.5">
-                      <DatabaseIcon :db-type="getConnectionType(targetConnectionId)" class="w-3.5 h-3.5" />
-                      <span class="truncate">{{ getConnectionName(targetConnectionId) }}</span>
+                <SearchableSelect
+                  v-model="targetConnectionId"
+                  :options="sqlConnections.map((c) => c.id)"
+                  :placeholder="t('transfer.selectConnection')"
+                  :search-placeholder="t('transfer.searchConnection')"
+                  :empty-text="t('common.noResults')"
+                  :display-name="getConnectionName"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                >
+                  <template #option-label="{ option, label }">
+                    <div class="flex min-w-0 items-center gap-1.5">
+                      <DatabaseIcon :db-type="connectionIconType(sqlConnections.find((c) => c.id === option))" class="h-3.5 w-3.5 shrink-0" />
+                      <ConnectionGroupBadge :connection-id="option" />
+                      <span class="min-w-0 flex-1 truncate">{{ label }}</span>
                     </div>
-                    <SelectValue v-else />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem v-for="c in sqlConnections" :key="c.id" :value="c.id">
-                      <div class="flex items-center gap-1.5">
-                        <DatabaseIcon :db-type="c.db_type" class="w-3.5 h-3.5" />
-                        {{ c.name }}
-                      </div>
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
+                  </template>
+                </SearchableSelect>
+              </div>
+
+              <!-- Target Catalog (Doris/StarRocks multi-catalog) -->
+              <div v-if="targetCatalogs.length > 1" class="space-y-1.5">
+                <Label class="text-xs">{{ t("transfer.targetCatalog") }}</Label>
+                <SearchableSelect
+                  v-model="targetCatalog"
+                  :options="targetCatalogs.map((c) => c.name)"
+                  :placeholder="t('transfer.selectCatalog')"
+                  :search-placeholder="t('transfer.searchCatalog')"
+                  :empty-text="t('common.noResults')"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                />
               </div>
 
               <div class="space-y-1.5">
                 <Label class="text-xs">{{ t("transfer.targetDatabase") }}</Label>
-                <Select v-model="targetDatabase" :disabled="!targetDatabases.length">
-                  <SelectTrigger class="h-8 text-xs">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem v-for="db in targetDatabases" :key="db" :value="db">{{ db }}</SelectItem>
-                  </SelectContent>
-                </Select>
+                <SearchableSelect
+                  v-model="targetDatabase"
+                  :options="targetDatabases"
+                  :placeholder="t('transfer.selectDatabase')"
+                  :search-placeholder="t('transfer.searchDatabase')"
+                  :empty-text="t('common.noResults')"
+                  :disabled="!targetDatabases.length"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                />
               </div>
-            </div>
 
-            <div v-if="targetSchemas.length" class="space-y-1.5">
-              <Label class="text-xs">{{ t("transfer.targetSchema") }}</Label>
-              <Select v-model="targetSchema">
-                <SelectTrigger class="h-8 text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem v-for="schema in targetSchemas" :key="schema" :value="schema">{{ schema }}</SelectItem>
-                </SelectContent>
-              </Select>
+              <div v-if="targetSchemas.length" class="space-y-1.5">
+                <Label class="text-xs">{{ t("transfer.targetSchema") }}</Label>
+                <SearchableSelect
+                  v-model="targetSchema"
+                  :options="targetSchemas"
+                  :placeholder="t('transfer.selectSchema')"
+                  :search-placeholder="t('transfer.searchSchema')"
+                  :empty-text="t('common.noResults')"
+                  trigger-variant="outline"
+                  trigger-class="h-8 w-full justify-between text-xs"
+                  content-class="w-[var(--reka-popover-trigger-width)]"
+                />
+              </div>
             </div>
           </div>
 
           <!-- Tables Section -->
-          <div class="space-y-2">
+          <div class="flex min-h-0 flex-col gap-2">
             <div class="flex items-center justify-between">
               <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
                 {{ t("transfer.tables") }}
-                <span v-if="sourceTables.length" class="text-muted-foreground/60"
-                  >({{ selectedTables.size }}/{{ sourceTables.length }})</span
-                >
+                <span v-if="sourceTables.length" class="text-muted-foreground/60">({{ selectedTables.size }}/{{ sourceTables.length }})</span>
               </div>
-              <Button
-                v-if="sourceTables.length"
-                variant="ghost"
-                size="sm"
-                class="h-6 text-xs px-2"
-                @click="toggleSelectAll"
-              >
+              <Button v-if="sourceTables.length" variant="ghost" size="sm" class="h-6 text-xs px-2" @click="toggleSelectAll">
                 {{ allSelected ? t("transfer.deselectAll") : t("transfer.selectAll") }}
               </Button>
             </div>
 
-            <Input
-              v-if="sourceTables.length > 5"
-              v-model="tableSearch"
-              :placeholder="t('transfer.searchTables')"
-              class="h-7 text-xs"
-            />
+            <Input v-if="sourceTables.length > 5" v-model="tableSearch" :placeholder="t('transfer.searchTables')" class="h-7 text-xs" />
 
             <div v-if="loadingTables" class="flex items-center gap-2 text-xs text-muted-foreground py-4 justify-center">
               <Loader2 class="w-3.5 h-3.5 animate-spin" />
               {{ t("common.loading") }}
             </div>
-            <div
-              v-else-if="!sourceConnectionId || !sourceDatabase"
-              class="text-xs text-muted-foreground py-4 text-center"
-            >
+            <div v-else-if="!sourceConnectionId || !sourceDatabase" class="text-xs text-muted-foreground py-4 text-center">
               {{ t("transfer.selectSourceFirst") }}
             </div>
             <div v-else-if="sourceTables.length === 0" class="text-xs text-muted-foreground py-4 text-center">
               {{ t("transfer.noTables") }}
             </div>
-            <div v-else class="border rounded-md max-h-[200px] overflow-y-auto">
-              <div
-                v-for="table in filteredTables"
-                :key="table"
-                class="flex items-center gap-2 px-2.5 py-1.5 hover:bg-muted/50 cursor-pointer text-xs"
-                @click="toggleTable(table)"
-              >
+            <div v-else class="min-h-0 max-h-[200px] overflow-y-auto rounded-md border">
+              <div v-for="table in filteredTables" :key="table" class="flex items-center gap-2 px-2.5 py-1.5 hover:bg-muted/50 cursor-pointer text-xs" @click="toggleTable(table)">
                 <CheckSquare v-if="selectedTables.has(table)" class="w-3.5 h-3.5 text-primary shrink-0" />
                 <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
                 <span class="truncate">{{ table }}</span>
@@ -573,121 +747,65 @@ const overallRowsLabel = computed(() =>
               </Select>
             </div>
             <div class="flex items-center gap-3">
+              <Label class="text-xs shrink-0">{{ t("transfer.targetTableNameCase") }}</Label>
+              <Select v-model="targetTableNameCase">
+                <SelectTrigger class="h-7 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="preserve">{{ t("transfer.tableNameCasePreserve") }}</SelectItem>
+                  <SelectItem value="lower">{{ t("transfer.tableNameCaseLower") }}</SelectItem>
+                  <SelectItem value="upper">{{ t("transfer.tableNameCaseUpper") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div class="flex items-center gap-3">
               <Label class="text-xs shrink-0">{{ t("transfer.batchSize") }}</Label>
-              <Input
-                v-model.number="batchSize"
-                type="number"
-                min="100"
-                max="10000"
-                step="100"
-                class="h-7 text-xs w-24"
-              />
+              <Input v-model.number="batchSize" type="number" min="100" max="10000" step="100" class="h-7 text-xs w-24" />
             </div>
           </div>
-        </div>
-
-        <!-- Progress View -->
-        <div v-else class="py-3 space-y-3">
-          <div class="flex items-center justify-between text-xs text-muted-foreground">
-            <span>
-              {{ t("transfer.overallProgress") }}: {{ completedTables }} / {{ selectedTables.size }}
-              {{ t("transfer.tables").toLowerCase() }} · {{ overallRowsLabel }}
-              {{ t("grid.rows", { count: "" }).trim() }}
-            </span>
-            <span v-if="overallDone && !failedTables" class="text-green-600 font-medium">{{
-              t("transfer.completed")
-            }}</span>
-            <span v-else-if="overallDone && failedTables" class="text-amber-600 font-medium">
-              {{ t("transfer.completedWithErrors", { count: failedTables }) }}
-            </span>
-            <span v-else-if="overallCancelled" class="text-yellow-600 font-medium">{{ t("transfer.cancelled") }}</span>
-            <span v-else-if="overallError" class="text-destructive font-medium">{{ t("transfer.failed") }}</span>
-          </div>
-
-          <div class="w-full bg-muted rounded-full h-2 overflow-hidden">
-            <div
-              class="h-full rounded-full transition-all duration-300"
-              :class="
-                overallError
-                  ? 'bg-destructive'
-                  : overallCancelled
-                    ? 'bg-yellow-500'
-                    : overallDone && failedTables
-                      ? 'bg-amber-500'
-                      : 'bg-primary'
-              "
-              :style="{
-                width: `${selectedTables.size ? (completedTables / selectedTables.size) * 100 : 0}%`,
-              }"
-            />
-          </div>
-
-          <div class="border rounded-md max-h-[280px] overflow-y-auto">
-            <div
-              v-for="table in [...selectedTables]"
-              :key="table"
-              class="flex items-center justify-between px-2.5 py-1.5 text-xs border-b last:border-b-0"
-            >
-              <span class="truncate">{{ table }}</span>
-              <div class="flex items-center gap-1.5 shrink-0 text-muted-foreground">
-                <template v-if="transferProgress.get(table)">
-                  <template v-if="transferProgress.get(table)!.status === 'running'">
-                    <Loader2 class="w-3 h-3 animate-spin text-primary" />
-                    <span>{{ formatTableRows(transferProgress.get(table)!) }}</span>
-                  </template>
-                  <template
-                    v-else-if="
-                      transferProgress.get(table)!.status === 'tableDone' ||
-                      transferProgress.get(table)!.status === 'done'
-                    "
-                  >
-                    <Check class="w-3 h-3 text-green-500" />
-                    <span>{{ formatTableRows(transferProgress.get(table)!) }}</span>
-                  </template>
-                  <template v-else-if="transferProgress.get(table)!.status === 'error'">
-                    <X class="w-3 h-3 text-destructive" />
-                    <span>{{ formatTableRows(transferProgress.get(table)!) }}</span>
-                    <span
-                      class="max-w-[520px] whitespace-normal break-words text-destructive"
-                      :title="transferProgress.get(table)!.error ?? ''"
-                    >
-                      {{ transferProgress.get(table)!.error }}
-                    </span>
-                  </template>
-                  <template v-else-if="transferProgress.get(table)!.status === 'cancelled'">
-                    <X class="w-3 h-3 text-yellow-500" />
-                    <span>{{ t("transfer.cancelled") }}</span>
-                  </template>
-                </template>
-                <span v-else class="text-muted-foreground/40">—</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- Status message -->
         </div>
       </div>
 
-      <DialogFooter>
-        <template v-if="!isTransferring">
-          <Button variant="outline" size="sm" @click="open = false">
-            {{ t("transfer.cancel") }}
-          </Button>
-          <Button size="sm" :disabled="!canStart" @click="startTransfer">
-            <ArrowRightLeft class="w-3.5 h-3.5 mr-1.5" />
-            {{ t("transfer.start") }}
-          </Button>
-        </template>
-        <template v-else-if="overallDone || overallCancelled || overallError">
-          <Button size="sm" @click="open = false">
-            {{ t("common.close") }}
-          </Button>
-        </template>
-        <template v-else>
-          <Button variant="destructive" size="sm" @click="cancelTransfer">
-            {{ t("transfer.cancel") }}
-          </Button>
-        </template>
+      <DialogFooter class="shrink-0">
+        <Button variant="outline" size="sm" @click="open = false">
+          {{ t("transfer.cancel") }}
+        </Button>
+        <Button size="sm" :disabled="!canStart || isSubmitting" @click="startTransfer">
+          <Loader2 v-if="isSubmitting" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
+          <ArrowRightLeft v-else class="w-3.5 h-3.5 mr-1.5" />
+          {{ t("transfer.start") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="ownershipDialogOpen">
+    <DialogContent class="sm:max-w-[520px]" @interact-outside.prevent>
+      <DialogHeader>
+        <DialogTitle>{{ t("transfer.ownershipTitle") }}</DialogTitle>
+      </DialogHeader>
+      <div class="space-y-3 text-sm">
+        <p class="text-muted-foreground">
+          {{ t("transfer.ownershipMessage", { owners: ownershipMissingOwners.join(", ") }) }}
+        </p>
+        <div class="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          {{ t("transfer.ownershipSkipDetails") }}
+        </div>
+        <div class="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          {{ t("transfer.ownershipTargetOwner", { owner: ownershipTargetOwner }) }}
+        </div>
+      </div>
+      <DialogFooter class="gap-2">
+        <Button variant="outline" size="sm" @click="resolveOwnershipDecision(null)">
+          {{ t("transfer.cancel") }}
+        </Button>
+        <Button variant="secondary" size="sm" @click="resolveOwnershipDecision('skip')">
+          {{ t("transfer.ownershipSkip") }}
+        </Button>
+        <Button size="sm" @click="resolveOwnershipDecision('reassignMissing')">
+          {{ t("transfer.ownershipConfirm") }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

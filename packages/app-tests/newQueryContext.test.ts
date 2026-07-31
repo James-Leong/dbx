@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { resolveNewQueryTarget } from "../../apps/desktop/src/lib/newQueryContext.ts";
+import { resolveNewQueryTarget } from "../../apps/desktop/src/lib/sql/newQueryContext.ts";
 import type { ConnectionConfig, QueryTab, TreeNode } from "../../apps/desktop/src/types/database.ts";
 
 function connection(id: string, database = ""): ConnectionConfig {
@@ -13,6 +13,15 @@ function connection(id: string, database = ""): ConnectionConfig {
     username: "postgres",
     password: "",
     database,
+  };
+}
+
+function sqliteConnection(id: string, database = ""): ConnectionConfig {
+  return {
+    ...connection(id, database),
+    db_type: "sqlite",
+    host: "/tmp/real.sqlite",
+    port: 0,
   };
 }
 
@@ -48,6 +57,7 @@ test("new query target prefers the active data tab context", () => {
     connectionId: "conn-data",
     database: "analytics",
     schema: undefined,
+    catalog: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -73,6 +83,7 @@ test("new query target uses the selected sidebar node when there is no active ta
     connectionId: "conn-tree",
     database: "reporting",
     schema: "public",
+    catalog: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -96,6 +107,7 @@ test("new query target prefers the selected sidebar node after sidebar focus", (
     connectionId: "conn-tree",
     database: "reporting",
     schema: undefined,
+    catalog: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -112,6 +124,21 @@ test("new query target refreshes default database for connection-only sidebar no
     connectionId: "conn-tree",
     database: "saved_default",
     schema: undefined,
+    catalog: undefined,
     shouldRefreshDefaultDatabase: true,
   });
+});
+
+test("new query target repairs stale SQLite file paths without changing attached aliases", () => {
+  const stalePathTarget = resolveNewQueryTarget({
+    activeTab: queryTab("sqlite", "/tmp/stale.sqlite"),
+    connections: [sqliteConnection("sqlite", "/tmp/stale.sqlite")],
+  });
+  const attachedAliasTarget = resolveNewQueryTarget({
+    activeTab: queryTab("sqlite", "analytics"),
+    connections: [sqliteConnection("sqlite")],
+  });
+
+  assert.equal(stalePathTarget?.database, "main");
+  assert.equal(attachedAliasTarget?.database, "analytics");
 });

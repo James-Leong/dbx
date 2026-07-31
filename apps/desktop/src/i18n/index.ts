@@ -1,22 +1,25 @@
 import { createI18n } from "vue-i18n";
-import zhCN from "./locales/zh-CN";
-import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import en from "./locales/en";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 
-export type Locale = "en" | "es" | "it" | "pt-BR" | "zh-CN" | "zh-TW";
+export type Locale = "en" | "es" | "it" | "ja" | "ko" | "pt-BR" | "zh-CN" | "zh-TW";
 type LocaleMessages = Record<string, unknown>;
 type I18nGlobal = {
   locale: { value: Locale };
   setLocaleMessage: (locale: Locale, messages: LocaleMessages) => void;
 };
 
-const supportedLocales: Locale[] = ["en", "es", "it", "pt-BR", "zh-CN", "zh-TW"];
-const defaultLocale: Locale = "zh-CN";
+const supportedLocales: Locale[] = ["en", "es", "it", "ja", "ko", "pt-BR", "zh-CN", "zh-TW"];
+const defaultLocale: Locale = "en";
 const loadedLocales = new Set<Locale>([defaultLocale]);
-const localeLoaders: Record<Exclude<Locale, "zh-CN">, () => Promise<{ default: LocaleMessages }>> = {
-  en: () => import("./locales/en"),
+const localeLoaders: Record<Exclude<Locale, "en">, () => Promise<{ default: LocaleMessages }>> = {
   es: () => import("./locales/es"),
   it: () => import("./locales/it"),
+  ja: () => import("./locales/ja"),
+  ko: () => import("./locales/ko"),
   "pt-BR": () => import("./locales/pt-BR"),
+  "zh-CN": () => import("./locales/zh-CN"),
   "zh-TW": () => import("./locales/zh-TW"),
 };
 
@@ -31,12 +34,7 @@ export function localeFromLanguageTag(value: string | null | undefined): Locale 
   if (!value) return null;
   const normalized = value.replace("_", "-").toLowerCase();
   if (normalized === "zh" || normalized.startsWith("zh-")) {
-    if (
-      normalized.includes("hant") ||
-      normalized.startsWith("zh-tw") ||
-      normalized.startsWith("zh-hk") ||
-      normalized.startsWith("zh-mo")
-    ) {
+    if (normalized.includes("hant") || normalized.startsWith("zh-tw") || normalized.startsWith("zh-hk") || normalized.startsWith("zh-mo")) {
       return "zh-TW";
     }
     return "zh-CN";
@@ -44,6 +42,8 @@ export function localeFromLanguageTag(value: string | null | undefined): Locale 
   if (normalized === "en" || normalized.startsWith("en-")) return "en";
   if (normalized === "es" || normalized.startsWith("es-")) return "es";
   if (normalized === "it" || normalized.startsWith("it-")) return "it";
+  if (normalized === "ja" || normalized.startsWith("ja-")) return "ja";
+  if (normalized === "ko" || normalized.startsWith("ko-")) return "ko";
   if (normalized === "pt" || normalized.startsWith("pt-")) return "pt-BR";
   return null;
 }
@@ -76,28 +76,40 @@ const i18n = createI18n({
   locale: initialLocale,
   fallbackLocale: defaultLocale,
   messages: {
-    "zh-CN": zhCN,
+    en,
   },
 });
 const i18nGlobal = i18n.global as unknown as I18nGlobal;
 
 export async function loadLocaleMessages(locale: Locale) {
   if (loadedLocales.has(locale)) return;
-  const loader = localeLoaders[locale as Exclude<Locale, "zh-CN">];
+  const loader = localeLoaders[locale as Exclude<Locale, "en">];
   if (!loader) return;
   const messages = await loader();
   i18nGlobal.setLocaleMessage(locale, messages.default);
   loadedLocales.add(locale);
 }
 
+async function syncLocaleToBackend(locale: Locale) {
+  if (!isTauriRuntime()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_app_locale", { locale });
+  } catch (error) {
+    console.warn("[DBX][i18n] failed to sync locale to backend", error);
+  }
+}
+
 export async function loadSavedLocale() {
   await loadLocaleMessages(initialLocale);
+  void syncLocaleToBackend(initialLocale);
 }
 
 export async function setLocale(locale: Locale) {
   await loadLocaleMessages(locale);
   i18nGlobal.locale.value = locale;
   safeLocalStorageSet("dbx-locale", locale);
+  void syncLocaleToBackend(locale);
 }
 
 export function currentLocale(): Locale {

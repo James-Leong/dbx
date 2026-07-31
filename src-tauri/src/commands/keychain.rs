@@ -5,7 +5,7 @@ pub async fn read_keychain_password(service: String, account: Option<String>) ->
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (service, account);
-        return Err("Keychain access is only available on macOS".to_string());
+        Err("Keychain access is only available on macOS".to_string())
     }
 
     #[cfg(target_os = "macos")]
@@ -18,7 +18,7 @@ pub async fn read_keychain_password(service: String, account: Option<String>) ->
 
 #[cfg(target_os = "macos")]
 fn read_keychain_password_blocking(service: String, account: Option<String>) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("security");
+    let mut cmd = dbx_core::process::new_std_command("security");
     cmd.args(["find-generic-password", "-s", &service, "-w"]);
     if let Some(ref acct) = account {
         cmd.args(["-a", acct]);
@@ -32,9 +32,11 @@ fn read_keychain_password_blocking(service: String, account: Option<String>) -> 
     } else {
         // Exit code 44 = user cancelled the authorization dialog
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if output.status.code() == Some(44) || stderr.contains("User canceled") {
-            Ok(String::new())
-        } else if stderr.contains("could not be found") || stderr.contains("The specified item could not be found") {
+        if output.status.code() == Some(44)
+            || stderr.contains("User canceled")
+            || stderr.contains("could not be found")
+            || stderr.contains("The specified item could not be found")
+        {
             Ok(String::new())
         } else {
             Err(format!("Keychain read failed: {}", stderr.trim()))

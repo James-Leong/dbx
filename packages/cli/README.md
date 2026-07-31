@@ -4,11 +4,44 @@ Command line interface for DBX database connections, schema inspection, safe que
 
 ## Install
 
+### npm
+
 ```bash
 npm install -g @dbx-app/cli
 ```
 
-Requires Node.js 22.13.0 or newer.
+### Homebrew
+
+```bash
+brew tap t8y2/dbx
+brew install dbx-cli
+```
+
+The npm package installs the native CLI for the current platform automatically. Node.js 18.18.0 or newer is only needed for the npm launcher; direct native distributions do not require Node.js.
+
+### Native downloads
+
+The `packages-v*` GitHub Release also provides standalone native CLI archives:
+
+| Platform | Archive |
+| --- | --- |
+| macOS Apple Silicon | `dbx-cli-darwin-arm64.tar.gz` |
+| macOS Intel | `dbx-cli-darwin-x64.tar.gz` |
+| Linux glibc ARM64 | `dbx-cli-linux-arm64-gnu.tar.gz` |
+| Linux glibc x64 | `dbx-cli-linux-x64-gnu.tar.gz` |
+| Windows ARM64 | `dbx-cli-win32-arm64.zip` |
+| Windows x64 | `dbx-cli-win32-x64.zip` |
+
+Verify the downloaded archive with `CLI-SHA256SUMS`, extract it, and run the native binary directly:
+
+```bash
+tar -xzf dbx-cli-linux-x64-gnu.tar.gz
+chmod +x dbx
+./dbx --version
+./dbx connections list --json
+```
+
+Standalone binaries do not require Node.js. They read the same DBX connection storage as the desktop application; set `DBX_DATA_DIR` when using a custom or portable data directory.
 
 ## Usage
 
@@ -29,17 +62,17 @@ dbx open local users
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `dbx doctor` | Show local DBX config and desktop bridge diagnostics |
-| `dbx capabilities` | Show direct-query and desktop-bridge database support |
-| `dbx connections list` | List DBX connections without printing secrets |
-| `dbx schema list <connection>` | List tables and views |
-| `dbx schema describe <connection> <table>` | Show table columns |
-| `dbx query <connection> <sql>` | Execute one SQL statement |
-| `dbx query <connection> --file ./query.sql` | Execute SQL from a file |
-| `dbx context <connection>` | Print compact schema context for prompts |
-| `dbx open <connection> <table>` | Open a table in DBX Desktop |
+| Command                                     | Description                                           |
+| ------------------------------------------- | ----------------------------------------------------- |
+| `dbx doctor`                                | Show local DBX config and desktop bridge diagnostics  |
+| `dbx capabilities`                          | Show direct-query and desktop-bridge database support |
+| `dbx connections list`                      | List DBX connections without printing secrets         |
+| `dbx schema list <connection>`              | List tables and views                                 |
+| `dbx schema describe <connection> <table>`  | Show table columns                                    |
+| `dbx query <connection> <sql>`              | Execute one SQL statement                             |
+| `dbx query <connection> --file ./query.sql` | Execute SQL from a file                               |
+| `dbx context <connection>`                  | Print compact schema context for prompts              |
+| `dbx open <connection> <table>`             | Open a table in DBX Desktop                           |
 
 ## Output
 
@@ -81,37 +114,33 @@ Some CLI commands can run without DBX Desktop:
 - `query`
 - `context`
 
-Direct execution currently supports PostgreSQL/Redshift, MySQL-compatible databases (MySQL, Doris, StarRocks), and SQLite. Other database types use the DBX Desktop bridge until their drivers are added to `@dbx-app/node-core`.
+Direct execution supports PostgreSQL/Redshift, MySQL-compatible databases (MySQL, Doris, StarRocks), and SQLite. Other database types use the DBX Desktop bridge or DBX Agent/JDBC infrastructure.
 
 Use `dbx doctor` to check whether the DBX connection database, connection table, native SQLite loader, and desktop bridge are available. Use `dbx capabilities` to list direct-query and bridge-required database types.
 
-If `dbx doctor` reports a `NODE_MODULE_VERSION` mismatch after switching Node.js versions, rebuild the native dependencies with the Node.js version you use to run `dbx`:
-
-```bash
-pnpm rebuild better-sqlite3 keytar --pending
-```
-
-For global npm installs, reinstall the CLI with the same Node.js version:
+If the optional platform package was not installed, reinstall without `--no-optional`:
 
 ```bash
 npm uninstall -g @dbx-app/cli
 npm install -g @dbx-app/cli
 ```
 
+The native CLI does not require `better-sqlite3` and is not coupled to the Node.js ABI.
+
 ## Error Codes
 
 CLI JSON errors use stable codes:
 
-| Code | Meaning |
-|---|---|
-| `UNKNOWN_OPTION` | An unsupported flag was provided |
-| `INVALID_OPTION` | A flag is missing a value or has an invalid value |
-| `INVALID_ARGUMENT` | Positional arguments are missing or conflicting |
+| Code                     | Meaning                                             |
+| ------------------------ | --------------------------------------------------- |
+| `UNKNOWN_OPTION`         | An unsupported flag was provided                    |
+| `INVALID_OPTION`         | A flag is missing a value or has an invalid value   |
+| `INVALID_ARGUMENT`       | Positional arguments are missing or conflicting     |
 | `CONNECTION_STORE_ERROR` | DBX connection storage exists but could not be read |
-| `CONNECTION_NOT_FOUND` | No DBX connection matched the requested name |
-| `SQL_BLOCKED` | SQL safety rules blocked execution |
-| `DBX_NOT_RUNNING` | DBX Desktop bridge is unavailable |
-| `ERROR` | Unexpected runtime failure |
+| `CONNECTION_NOT_FOUND`   | No DBX connection matched the requested name        |
+| `SQL_BLOCKED`            | SQL safety rules blocked execution                  |
+| `DBX_NOT_RUNNING`        | DBX Desktop bridge is unavailable                   |
+| `ERROR`                  | Unexpected runtime failure                          |
 
 ## Codex
 

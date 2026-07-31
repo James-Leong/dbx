@@ -63,6 +63,30 @@ ${StrLoc}
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
 !define STARTMENUFOLDER "{{start_menu_folder}}"
+!searchreplace WEBVIEW2LOADERSRCPATH "${MAINBINARYSRCPATH}" "\${MAINBINARYNAME}.exe" "\WebView2Loader.dll"
+
+!macro ReadWebView2RuntimeVersion RESULT
+  StrCpy ${RESULT} ""
+  ${If} ${RunningX64}
+    ReadRegStr ${RESULT} HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
+  ${Else}
+    ReadRegStr ${RESULT} HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
+  ${EndIf}
+  ${If} ${RESULT} == ""
+    ReadRegStr ${RESULT} HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
+  ${EndIf}
+!macroend
+
+!macro ShouldAbortWebView2OfflineInstall INSTALL_RESULT RUNTIME_VERSION MINIMUM_COMPARISON RESULT
+  StrCpy ${RESULT} 0
+  ${If} ${INSTALL_RESULT} <> 0
+    ${If} ${RUNTIME_VERSION} == ""
+      StrCpy ${RESULT} 1
+    ${ElseIf} ${MINIMUM_COMPARISON} = 1
+      StrCpy ${RESULT} 1
+    ${EndIf}
+  ${EndIf}
+!macroend
 
 Var PassiveMode
 Var UpdateMode
@@ -541,15 +565,36 @@ Section EarlyChecks
 SectionEnd
 
 Section WebView2
+  ; Offline packages carry the runtime they were built for. Always run that
+  ; installer so an existing stale runtime is upgraded without network access.
+  !if "${INSTALLWEBVIEW2MODE}" == "offlineInstaller"
+    Delete "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
+    File "/oname=$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe" "${WEBVIEW2INSTALLERPATH}"
+    DetailPrint "$(installingWebview2)"
+    ExecWait '"$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe" ${WEBVIEW2INSTALLERARGS} /install' $1
+    Delete "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
+    StrCpy $4 ""
+    StrCpy $R0 0
+    ${If} $1 = 0
+      DetailPrint "$(webview2InstallSuccess)"
+    ${Else}
+      DetailPrint "$(webview2InstallError)"
+      ; Enterprise policy can make the bundled installer return a non-zero code.
+      ; Continue when a usable Runtime is already registered on the machine.
+      !insertmacro ReadWebView2RuntimeVersion $4
+      ${If} $4 != ""
+        !if "${MINIMUMWEBVIEW2VERSION}" != ""
+          ${VersionCompare} "${MINIMUMWEBVIEW2VERSION}" "$4" $R0
+        !endif
+      ${EndIf}
+    ${EndIf}
+    !insertmacro ShouldAbortWebView2OfflineInstall $1 $4 $R0 $R1
+    ${If} $R1 = 1
+      Abort "$(webview2AbortError)"
+    ${EndIf}
+  !else
   ; Check if Webview2 is already installed and skip this section
-  ${If} ${RunningX64}
-    ReadRegStr $4 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
-  ${Else}
-    ReadRegStr $4 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
-  ${EndIf}
-  ${If} $4 == ""
-    ReadRegStr $4 HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
-  ${EndIf}
+  !insertmacro ReadWebView2RuntimeVersion $4
 
   ${If} $4 == ""
     ; Webview2 installation
@@ -576,14 +621,6 @@ Section WebView2
         File "/oname=$TEMP\MicrosoftEdgeWebview2Setup.exe" "${WEBVIEW2BOOTSTRAPPERPATH}"
         DetailPrint "$(installingWebview2)"
         StrCpy $6 "$TEMP\MicrosoftEdgeWebview2Setup.exe"
-        Goto install_webview2
-      !endif
-
-      !if "${INSTALLWEBVIEW2MODE}" == "offlineInstaller"
-        Delete "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
-        File "/oname=$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe" "${WEBVIEW2INSTALLERPATH}"
-        DetailPrint "$(installingWebview2)"
-        StrCpy $6 "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
         Goto install_webview2
       !endif
 
@@ -630,6 +667,7 @@ Section WebView2
       ${EndIf}
     !endif
   ${EndIf}
+  !endif
 SectionEnd
 
 Section Install
@@ -643,6 +681,8 @@ Section Install
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
+  ; MSVC links WebView2Loader statically, while GNU builds may emit a DLL next to the binary.
+  File /nonfatal /a "/oname=WebView2Loader.dll" "${WEBVIEW2LOADERSRCPATH}"
 
   ; Copy resources
   {{#each resources_dirs}}
@@ -781,6 +821,7 @@ Section Uninstall
   ; Delete the app directory and its content from disk
   ; Copy main executable
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+  Delete "$INSTDIR\WebView2Loader.dll"
 
   ; Delete resources
   {{#each resources}}

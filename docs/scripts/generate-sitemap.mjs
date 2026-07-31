@@ -1,11 +1,9 @@
-import { readdirSync, writeFileSync } from 'fs';
-import { resolve, relative } from 'path';
+import { readdirSync, writeFileSync } from "fs";
+import { resolve, relative } from "path";
 
-const OUT_DIR = resolve(import.meta.dirname, '../out');
-const SITE_URL = 'https://dbxio.com';
-const TODAY = new Date().toISOString().split('T')[0];
-
-const EXCLUDE = new Set(['index.html', '404.html', '_not-found.html']);
+const OUT_DIR = resolve(import.meta.dirname, "../out");
+const SITE_URL = "https://dbxio.com";
+const EXCLUDE = new Set(["index.html", "404.html", "_not-found.html"]);
 
 function* walkDir(dir) {
   const entries = readdirSync(dir, { withFileTypes: true });
@@ -13,7 +11,7 @@ function* walkDir(dir) {
     const fullPath = resolve(dir, entry.name);
     if (entry.isDirectory()) {
       yield* walkDir(fullPath);
-    } else if (entry.isFile() && entry.name.endsWith('.html')) {
+    } else if (entry.isFile() && entry.name.endsWith(".html")) {
       yield fullPath;
     }
   }
@@ -21,11 +19,11 @@ function* walkDir(dir) {
 
 function pathToUrl(filePath) {
   const rel = relative(OUT_DIR, filePath);
-  return '/' + rel.replace(/\.html$/, '').replace(/\\/g, '/');
+  return "/" + rel.replace(/\.html$/, "").replace(/\\/g, "/");
 }
 
 const htmlFiles = [...walkDir(OUT_DIR)].filter((f) => {
-  const basename = f.split('/').pop() ?? '';
+  const basename = f.split("/").pop() ?? "";
   return !EXCLUDE.has(basename);
 });
 
@@ -38,7 +36,7 @@ for (const file of htmlFiles) {
     pagesByPath.set(url, { en: null, cn: null });
     continue;
   }
-  const relativePath = match[2] || '/';
+  const relativePath = match[2] || "/";
   if (!pagesByPath.has(relativePath)) {
     pagesByPath.set(relativePath, { en: null, cn: null });
   }
@@ -51,23 +49,26 @@ const urls = [];
 const seen = new Set();
 
 for (const [, langs] of pagesByPath) {
-  const primary = langs.en || langs.cn;
-  if (!primary || seen.has(primary)) continue;
-  seen.add(primary);
+  const localizedPages = [langs.en, langs.cn].filter(Boolean);
+  if (localizedPages.length === 0) continue;
 
   const altLinks = [];
   if (langs.en) {
-    altLinks.push({ lang: 'en', href: `${SITE_URL}${langs.en}` });
+    altLinks.push({ lang: "en", href: `${SITE_URL}${langs.en}` });
   }
   if (langs.cn) {
-    altLinks.push({ lang: 'zh', href: `${SITE_URL}${langs.cn}` });
+    altLinks.push({ lang: "zh", href: `${SITE_URL}${langs.cn}` });
   }
 
   if (altLinks.length > 1) {
-    altLinks.push({ lang: 'x-default', href: `${SITE_URL}${langs.en}` });
+    altLinks.push({ lang: "x-default", href: `${SITE_URL}${langs.en}` });
   }
 
-  urls.push({ loc: `${SITE_URL}${primary}`, lastmod: TODAY, altLinks });
+  for (const localizedPage of localizedPages) {
+    if (seen.has(localizedPage)) continue;
+    seen.add(localizedPage);
+    urls.push({ loc: `${SITE_URL}${localizedPage}`, altLinks });
+  }
 }
 
 const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -78,13 +79,12 @@ ${urls
     (entry) =>
       `  <url>
     <loc>${entry.loc}</loc>
-    <lastmod>${entry.lastmod}</lastmod>
-${entry.altLinks.map((alt) => `    <xhtml:link rel="alternate" hreflang="${alt.lang}" href="${alt.href}" />`).join('\n')}
-  </url>`
+${entry.altLinks.map((alt) => `    <xhtml:link rel="alternate" hreflang="${alt.lang}" href="${alt.href}" />`).join("\n")}
+  </url>`,
   )
-  .join('\n')}
+  .join("\n")}
 </urlset>
 `;
 
-writeFileSync(resolve(OUT_DIR, 'sitemap.xml'), sitemapXml);
+writeFileSync(resolve(OUT_DIR, "sitemap.xml"), sitemapXml);
 console.log(`sitemap.xml generated with ${urls.length} URLs`);

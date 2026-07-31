@@ -9,6 +9,7 @@ import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.math.BigDecimal;
 import java.net.URL;
@@ -34,30 +35,49 @@ import java.sql.Types;
 import java.time.temporal.TemporalAccessor;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
 import java.util.ServiceLoader;
 import java.util.Set;
+import java.util.UUID;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 public final class DbxJdbcPlugin {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final int MAX_ROWS = 10_000;
+    private static final String JDBCX_URL_PREFIX = "jdbcx:";
+    private static final String JDBCX_EXTENSION_WHITELIST_PROPERTY = "jdbcx.extension.whitelist";
+    private static final String JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN = "-Ddbx.jdbcx.allowHighPrivilegeExtensions=";
+    private static final String JDBCX_SAFE_EXTENSION_WHITELIST = "help,var,version";
+    private static final String[] DEFAULT_TABLE_TYPES = new String[] {
+        "TABLE",
+        "VIEW",
+        "BASE TABLE",
+        "MATERIALIZED VIEW",
+        "SYSTEM TABLE",
+        "SYSTEM VIEW"
+    };
     private static final JdbcDriverQuirks DEFAULT_QUIRKS = new JdbcDriverQuirks(
         false,
         false,
         false,
         false,
         false,
-        StatementMaxRowsMode.APPLY_STATEMENT_MAX_ROWS
+        false,
+        StatementMaxRowsMode.READ_LOOP_ONLY
     );
     private static final JdbcDriverQuirks USE_CATALOG_QUIRKS = DEFAULT_QUIRKS.withUseCatalogFallbackSql(true);
     private static final JdbcDriverQuirks KINGBASE_QUIRKS = DEFAULT_QUIRKS.withIgnoreCatalogForSchemaMetadata(true);
+    private static final JdbcDriverQuirks TAOS_QUIRKS = DEFAULT_QUIRKS.withPreferExecuteQueryForResultSetSql(true);
     private static final JdbcDriverQuirks YASHAN_QUIRKS = new JdbcDriverQuirks(
         true,
         true,
+        false,
         false,
         false,
         false,
@@ -69,11 +89,13 @@ public final class DbxJdbcPlugin {
         true,
         false,
         false,
+        false,
         StatementMaxRowsMode.READ_LOOP_ONLY
     );
     private static final JdbcDriverQuirks ORACLE_QUIRKS = new JdbcDriverQuirks(
         false,
         true,
+        false,
         false,
         false,
         false,
@@ -89,11 +111,14 @@ public final class DbxJdbcPlugin {
         new JdbcDriverQuirkRule("jdbc:yasdb:", YASHAN_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:iris:", IRIS_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:oracle:", ORACLE_QUIRKS),
-        new JdbcDriverQuirkRule("jdbc:dm:", ORACLE_QUIRKS)
+        new JdbcDriverQuirkRule("jdbc:dm:", ORACLE_QUIRKS),
+        new JdbcDriverQuirkRule("jdbc:taos:", TAOS_QUIRKS),
+        new JdbcDriverQuirkRule("jdbc:taos-ws:", TAOS_QUIRKS)
     );
     private static String registeredDriverKey = "";
     private static String sharedConnectionKey = "";
     private static Connection sharedConnection;
+    private static final Map<String, QuerySession> QUERY_SESSIONS = new HashMap<>();
 
     record JdbcDriverQuirks(
         boolean skipExecutionContext,
@@ -101,6 +126,7 @@ public final class DbxJdbcPlugin {
         boolean caseInsensitiveSchemaMetadata,
         boolean useCatalogFallbackSql,
         boolean ignoreCatalogForSchemaMetadata,
+        boolean preferExecuteQueryForResultSetSql,
         StatementMaxRowsMode statementMaxRowsMode
     ) {
         JdbcDriverQuirks withUseCatalogFallbackSql(boolean value) {
@@ -110,6 +136,7 @@ public final class DbxJdbcPlugin {
                 caseInsensitiveSchemaMetadata,
                 value,
                 ignoreCatalogForSchemaMetadata,
+                preferExecuteQueryForResultSetSql,
                 statementMaxRowsMode
             );
         }
@@ -120,6 +147,19 @@ public final class DbxJdbcPlugin {
                 useOracleMetadata,
                 caseInsensitiveSchemaMetadata,
                 useCatalogFallbackSql,
+                value,
+                preferExecuteQueryForResultSetSql,
+                statementMaxRowsMode
+            );
+        }
+
+        JdbcDriverQuirks withPreferExecuteQueryForResultSetSql(boolean value) {
+            return new JdbcDriverQuirks(
+                skipExecutionContext,
+                useOracleMetadata,
+                caseInsensitiveSchemaMetadata,
+                useCatalogFallbackSql,
+                ignoreCatalogForSchemaMetadata,
                 value,
                 statementMaxRowsMode
             );
@@ -180,22 +220,67 @@ public final class DbxJdbcPlugin {
             }
             registerDrivers(connection);
             response.set("result", handle(method, params, connection));
-        } catch (Exception error) {
+        } catch (Throwable error) {
+            // The plugin protocol boundary must report linkage errors from vendor drivers instead of exiting silently.
             ObjectNode errorNode = MAPPER.createObjectNode();
-            errorNode.put("message", error.getMessage() == null ? error.toString() : error.getMessage());
+            errorNode.put("message", throwableMessage(error));
             response.set("error", errorNode);
         }
         return response;
     }
 
+    private static String throwableMessage(Throwable error) {
+        List<Throwable> causes = new ArrayList<>();
+        Throwable cause = error;
+        while (cause != null && !causes.contains(cause)) {
+            causes.add(cause);
+            cause = cause.getCause();
+        }
+        for (int i = causes.size() - 1; i >= 0; i--) {
+            Throwable current = causes.get(i);
+            String message = informativeThrowableMessage(current);
+            if (message != null) {
+                return message;
+            }
+            for (Throwable suppressed : current.getSuppressed()) {
+                message = informativeThrowableMessage(suppressed);
+                if (message != null) {
+                    return message;
+                }
+            }
+        }
+        return causes.isEmpty() ? error.toString() : causes.get(causes.size() - 1).toString();
+    }
+
+    private static String informativeThrowableMessage(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.isBlank()) {
+            return null;
+        }
+        String trimmed = message.trim();
+        if (error instanceof ClassNotFoundException || error instanceof NoClassDefFoundError) {
+            String className = trimmed.replace('/', '.');
+            if (className.startsWith("io.modelcontextprotocol.")) {
+                return "Missing JDBCX MCP runtime class " + className
+                    + ". Install io.github.jdbcx:io.modelcontextprotocol with the version required by the selected JDBCX runtime.";
+            }
+            return "Missing Java class " + className + ". Install the required runtime dependency.";
+        }
+        return trimmed.equals(error.getClass().getName()) || trimmed.equals(error.getClass().getSimpleName())
+            ? null
+            : trimmed;
+    }
+
     private static JsonNode handle(String method, JsonNode params, JsonNode connection) throws Exception {
         return switch (method) {
-            case "testConnection", "connect" -> {
+            case "testConnection" -> connectionTestResult(openConnection(connection));
+            case "connect" -> {
                 openConnection(connection);
                 ObjectNode result = MAPPER.createObjectNode();
                 result.put("ok", true);
                 yield result;
             }
+            case "connectionInfo" -> databaseInfoResult(openConnection(connection));
             case "executeQuery" -> executeQuery(
                 connection,
                 requireText(params, "sql"),
@@ -205,14 +290,42 @@ public final class DbxJdbcPlugin {
                 nonNegativeInt(params, "fetchSize", 0),
                 nonNegativeInt(params, "timeoutSecs", -1)
             );
+            case "executeQueryPage", "execute_query_page" -> executeQueryPage(
+                connection,
+                requireText(params, "sql"),
+                optionalText(params, "database"),
+                optionalText(params, "schema"),
+                positiveInt(params, "pageSize", 100),
+                positiveInt(params, "maxRows", MAX_ROWS),
+                nonNegativeInt(params, "fetchSize", 0),
+                nonNegativeInt(params, "timeoutSecs", -1)
+            );
+            case "fetchQueryPage", "fetch_query_page" -> fetchQueryPage(
+                requireText(params, "sessionId"),
+                positiveInt(params, "pageSize", 100)
+            );
+            case "closeQuerySession", "close_query_session" -> closeQuerySessionResult(requireText(params, "sessionId"));
             case "listDatabases" -> listDatabases(connection);
             case "listSchemas" -> listSchemas(connection, optionalText(params, "database"));
-            case "listTables" -> listTables(connection, optionalText(params, "database"), optionalText(params, "schema"));
+            case "listTables" -> listTables(
+                connection,
+                optionalText(params, "database"),
+                optionalText(params, "schema"),
+                optionalText(params, "filter"),
+                nonNegativeInt(params, "limit", 0),
+                nonNegativeInt(params, "offset", 0),
+                optionalStringList(params, "object_types")
+            );
             case "listObjects", "list_objects" -> listObjects(
                 connection,
                 optionalText(params, "database"),
-                optionalText(params, "schema")
+                optionalText(params, "schema"),
+                optionalText(params, "filter"),
+                nonNegativeInt(params, "limit", 0),
+                nonNegativeInt(params, "offset", 0),
+                optionalStringList(params, "object_types")
             );
+            case "listDataTypes", "list_data_types" -> listDataTypes(connection, optionalText(params, "database"));
             case "getObjectSource", "get_object_source" -> getObjectSource(
                 connection,
                 optionalText(params, "database"),
@@ -238,11 +351,104 @@ public final class DbxJdbcPlugin {
         };
     }
 
+    private static ObjectNode connectionTestResult(Connection connection) {
+        ObjectNode result = MAPPER.createObjectNode();
+        result.put("ok", true);
+        ObjectNode databaseInfo = databaseInfo(connection);
+        if (!databaseInfo.isEmpty()) {
+            result.set("databaseInfo", databaseInfo);
+        }
+        return result;
+    }
+
+    private static ObjectNode databaseInfoResult(Connection connection) {
+        ObjectNode result = MAPPER.createObjectNode();
+        ObjectNode databaseInfo = databaseInfo(connection);
+        if (!databaseInfo.isEmpty()) {
+            result.set("databaseInfo", databaseInfo);
+        }
+        return result;
+    }
+
+    private static ObjectNode databaseInfo(Connection connection) {
+        try {
+            DatabaseMetaData metadata = connection.getMetaData();
+            return metadata == null ? MAPPER.createObjectNode() : databaseInfo(metadata);
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+            return MAPPER.createObjectNode();
+        }
+    }
+
+    private static ObjectNode databaseInfo(DatabaseMetaData metadata) {
+        ObjectNode info = MAPPER.createObjectNode();
+        putMetadataText(info, "productName", metadata::getDatabaseProductName);
+        putMetadataText(info, "productVersion", metadata::getDatabaseProductVersion);
+        putIdentifierCase(
+            info,
+            "unquotedIdentifierCase",
+            metadata::storesLowerCaseIdentifiers,
+            metadata::storesUpperCaseIdentifiers,
+            metadata::storesMixedCaseIdentifiers
+        );
+        putIdentifierCase(
+            info,
+            "quotedIdentifierCase",
+            metadata::storesLowerCaseQuotedIdentifiers,
+            metadata::storesUpperCaseQuotedIdentifiers,
+            metadata::storesMixedCaseQuotedIdentifiers
+        );
+        putMetadataText(info, "driverName", metadata::getDriverName);
+        putMetadataText(info, "driverVersion", metadata::getDriverVersion);
+
+        Integer jdbcMajor = readMetadata(metadata::getJDBCMajorVersion);
+        Integer jdbcMinor = readMetadata(metadata::getJDBCMinorVersion);
+        if (jdbcMajor != null && jdbcMinor != null && jdbcMajor >= 0 && jdbcMinor >= 0) {
+            info.put("jdbcVersion", jdbcMajor + "." + jdbcMinor);
+        }
+        return info;
+    }
+
+    private static void putMetadataText(ObjectNode target, String key, SqlSupplier<String> supplier) {
+        String value = readMetadata(supplier);
+        if (value != null && !value.trim().isEmpty()) {
+            target.put(key, value.trim());
+        }
+    }
+
+    private static void putIdentifierCase(
+        ObjectNode target,
+        String key,
+        SqlSupplier<Boolean> lower,
+        SqlSupplier<Boolean> upper,
+        SqlSupplier<Boolean> mixed
+    ) {
+        if (Boolean.TRUE.equals(readMetadata(lower))) {
+            target.put(key, "lower");
+        } else if (Boolean.TRUE.equals(readMetadata(upper))) {
+            target.put(key, "upper");
+        } else if (Boolean.TRUE.equals(readMetadata(mixed))) {
+            target.put(key, "mixed");
+        }
+    }
+
+    private static <T> T readMetadata(SqlSupplier<T> supplier) {
+        try {
+            return supplier.get();
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+            return null;
+        }
+    }
+
+    private interface SqlSupplier<T> {
+        T get() throws SQLException;
+    }
+
     private static void registerDrivers(JsonNode connection) throws Exception {
         String driverKey = driverKey(connection);
         if (driverKey.equals(registeredDriverKey)) {
             return;
         }
+        closeSharedConnection();
         List<URL> urls = new ArrayList<>();
         JsonNode paths = connection.path("jdbc_driver_paths");
         if (paths.isArray()) {
@@ -289,9 +495,17 @@ public final class DbxJdbcPlugin {
         }
         closeSharedConnection();
 
+        JdbcUrlCredentials urlCredentials = extractJdbcUrlCredentials(url);
+        url = urlCredentials.url;
         Properties properties = new Properties();
         String username = optionalText(connection, "username");
         String password = optionalText(connection, "password");
+        if (username == null) {
+            username = urlCredentials.username;
+        }
+        if (password == null) {
+            password = urlCredentials.password;
+        }
         if (username != null) {
             properties.setProperty("user", username);
         }
@@ -299,6 +513,8 @@ public final class DbxJdbcPlugin {
             properties.setProperty("password", password);
         }
         applyConnectTimeout(connection, properties);
+        applyPagedFetchProperties(connection, url, properties);
+        applyJdbcxExtensionSecurity(connection, url, properties);
         if (isOracleUrl(url)) {
             applyOracleProperties(connection, properties);
         }
@@ -307,12 +523,110 @@ public final class DbxJdbcPlugin {
         return sharedConnection;
     }
 
+    private static void applyJdbcxExtensionSecurity(JsonNode connection, String url, Properties properties) {
+        if (isJdbcxUrl(url) && !jdbcxHighPrivilegeExtensionsEnabled(connection)) {
+            properties.setProperty(JDBCX_EXTENSION_WHITELIST_PROPERTY, JDBCX_SAFE_EXTENSION_WHITELIST);
+        }
+    }
+
+    private static boolean isJdbcxUrl(String url) {
+        return url != null && url.regionMatches(true, 0, JDBCX_URL_PREFIX, 0, JDBCX_URL_PREFIX.length());
+    }
+
+    private static boolean jdbcxHighPrivilegeExtensionsEnabled(JsonNode connection) {
+        JsonNode options = connection.path("agent_java_options");
+        if (!options.isArray()) {
+            return false;
+        }
+        for (int i = options.size() - 1; i >= 0; i--) {
+            String option = options.path(i).asText("").trim();
+            if (option.startsWith(JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN)) {
+                return Boolean.parseBoolean(option.substring(JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN.length()));
+            }
+        }
+        return false;
+    }
+
     private static void applyConnectTimeout(JsonNode connection, Properties properties) {
         int connectTimeoutSecs = positiveInt(connection, "connect_timeout_secs", 30);
         DriverManager.setLoginTimeout(connectTimeoutSecs);
+        if (isPrestoOrTrinoConnection(connection)) {
+            return;
+        }
         String value = Integer.toString(connectTimeoutSecs);
         properties.putIfAbsent("loginTimeout", value);
-        properties.putIfAbsent("connectTimeout", value);
+        if (!jdbcUrlHasParameter(jdbcUrl(connection), "connectTimeout")) {
+            properties.putIfAbsent("connectTimeout", connectTimeoutPropertyValue(connection, connectTimeoutSecs));
+        }
+    }
+
+    private static String connectTimeoutPropertyValue(JsonNode connection, int connectTimeoutSecs) {
+        if (usesMillisecondConnectTimeout(connection)) {
+            return Integer.toString(connectTimeoutSecs * 1000);
+        }
+        return Integer.toString(connectTimeoutSecs);
+    }
+
+    private static boolean usesMillisecondConnectTimeout(JsonNode connection) {
+        String url = jdbcUrl(connection);
+        if (
+            urlMatchesPrefix(url, "jdbc:mysql:") ||
+            urlMatchesPrefix(url, "jdbc:mariadb:") ||
+            urlMatchesPrefix(url, "jdbc:starrocks:") ||
+            urlMatchesPrefix(url, "jdbc:doris:")
+        ) {
+            return true;
+        }
+        String driverClass = optionalText(connection, "jdbc_driver_class");
+        if (driverClass == null) {
+            return false;
+        }
+        String normalized = driverClass.toLowerCase(Locale.ROOT);
+        return normalized.equals("com.mysql.cj.jdbc.driver") ||
+            normalized.equals("com.mysql.jdbc.driver") ||
+            normalized.equals("org.mariadb.jdbc.driver");
+    }
+
+    private static void applyPagedFetchProperties(JsonNode connection, String url, Properties properties) {
+        if (!isMysqlConnection(connection, url) || jdbcUrlHasParameter(url, "useCursorFetch")) {
+            return;
+        }
+        properties.putIfAbsent("useCursorFetch", "true");
+    }
+
+    private static boolean isMysqlConnection(JsonNode connection, String url) {
+        if (urlMatchesPrefix(url, "jdbc:mysql:")) {
+            return true;
+        }
+        String driverClass = optionalText(connection, "jdbc_driver_class");
+        if (driverClass == null) {
+            return false;
+        }
+        String normalized = driverClass.toLowerCase(Locale.ROOT);
+        return normalized.equals("com.mysql.cj.jdbc.driver") || normalized.equals("com.mysql.jdbc.driver");
+    }
+
+    private static boolean isPostgresConnection(JsonNode connection) {
+        if (urlMatchesPrefix(jdbcUrl(connection), "jdbc:postgresql:")) {
+            return true;
+        }
+        String driverClass = optionalText(connection, "jdbc_driver_class");
+        return driverClass != null && driverClass.equalsIgnoreCase("org.postgresql.Driver");
+    }
+
+    private static boolean isPrestoOrTrinoConnection(JsonNode connection) {
+        String url = jdbcUrl(connection);
+        if (urlMatchesPrefix(url, "jdbc:presto:") || urlMatchesPrefix(url, "jdbc:trino:")) {
+            return true;
+        }
+        String driverClass = optionalText(connection, "jdbc_driver_class");
+        if (driverClass == null) {
+            return false;
+        }
+        String normalized = driverClass.toLowerCase(Locale.ROOT);
+        return normalized.equals("io.prestosql.jdbc.prestodriver") ||
+            normalized.equals("com.facebook.presto.jdbc.prestodriver") ||
+            normalized.equals("io.trino.jdbc.trinodriver");
     }
 
     private static void applyOracleProperties(JsonNode connection, Properties properties) {
@@ -333,21 +647,22 @@ public final class DbxJdbcPlugin {
         int maxRows,
         int fetchSize,
         int timeoutSecs
-    ) throws SQLException {
+    ) throws Exception {
         long start = System.nanoTime();
         Connection conn = openConnection(connection);
         applyExecutionContext(connection, conn, database, schema);
         JdbcDriverQuirks quirks = driverQuirks(connection);
         try (Statement statement = conn.createStatement()) {
             applyStatementOptions(statement, maxRows, fetchSize, timeoutSecs, quirks);
-            boolean hasResultSet = statement.execute(trimStatementSql(sql));
+            String trimmedSql = trimStatementSql(sql);
+            ExecutedStatement executed = executeStatementForResult(statement, trimmedSql, quirks);
             ObjectNode result = MAPPER.createObjectNode();
             ArrayNode columns = MAPPER.createArrayNode();
             ArrayNode rows = MAPPER.createArrayNode();
             boolean truncated = false;
 
-            if (hasResultSet) {
-                try (ResultSet rs = statement.getResultSet()) {
+            try (ResultSet rs = executed.resultSet()) {
+                if (rs != null) {
                     ResultSetMetaData meta = rs.getMetaData();
                     int columnCount = meta.getColumnCount();
                     for (int i = 1; i <= columnCount; i++) {
@@ -370,11 +685,322 @@ public final class DbxJdbcPlugin {
 
             result.set("columns", columns);
             result.set("rows", rows);
-            result.put("affected_rows", hasResultSet ? 0 : Math.max(statement.getUpdateCount(), 0));
+            result.put("affected_rows", columns.isEmpty() ? Math.max(executed.updateCount(), 0) : 0);
             result.put("execution_time_ms", (System.nanoTime() - start) / 1_000_000);
             result.put("truncated", truncated);
             return result;
         }
+    }
+
+    private record ExecutedStatement(ResultSet resultSet, int updateCount) {
+    }
+
+    private static final class QuerySession {
+        private final String id;
+        private final Statement statement;
+        private final ResultSet resultSet;
+        private final ResultSetMetaData meta;
+        private final ArrayNode columns;
+        private final int maxRows;
+        private final long startNanos;
+        private final Connection connection;
+        private final boolean restoreAutoCommit;
+        private int rowsReturned;
+        private ArrayNode pendingRow;
+
+        private QuerySession(
+            String id,
+            Statement statement,
+            ResultSet resultSet,
+            ResultSetMetaData meta,
+            ArrayNode columns,
+            int maxRows,
+            long startNanos,
+            Connection connection,
+            boolean restoreAutoCommit
+        ) {
+            this.id = id;
+            this.statement = statement;
+            this.resultSet = resultSet;
+            this.meta = meta;
+            this.columns = columns;
+            this.maxRows = Math.max(1, maxRows);
+            this.startNanos = startNanos;
+            this.connection = connection;
+            this.restoreAutoCommit = restoreAutoCommit;
+        }
+    }
+
+    private static JsonNode executeQueryPage(
+        JsonNode connection,
+        String sql,
+        String database,
+        String schema,
+        int pageSize,
+        int maxRows,
+        int fetchSize,
+        int timeoutSecs
+    ) throws Exception {
+        long start = System.nanoTime();
+        Connection conn = openConnection(connection);
+        applyExecutionContext(connection, conn, database, schema);
+        JdbcDriverQuirks quirks = driverQuirks(connection);
+        boolean restoreAutoCommit = beginPagedQueryTransaction(connection, conn);
+        Statement statement;
+        try {
+            statement = createPagedQueryStatement(conn);
+        } catch (Exception | LinkageError error) {
+            restorePagedQueryTransaction(conn, restoreAutoCommit);
+            throw error;
+        }
+        try {
+            applyStatementOptions(statement, maxRows, fetchSize, timeoutSecs, quirks);
+            String trimmedSql = trimStatementSql(sql);
+            ExecutedStatement executed = executeStatementForResult(statement, trimmedSql, quirks);
+            ResultSet rs = executed.resultSet();
+            if (rs == null) {
+                ObjectNode result = MAPPER.createObjectNode();
+                result.set("columns", MAPPER.createArrayNode());
+                result.set("rows", MAPPER.createArrayNode());
+                result.put("affected_rows", Math.max(executed.updateCount(), 0));
+                result.put("execution_time_ms", (System.nanoTime() - start) / 1_000_000);
+                result.put("truncated", false);
+                result.putNull("session_id");
+                result.put("has_more", false);
+                statement.close();
+                restorePagedQueryTransaction(conn, restoreAutoCommit);
+                return result;
+            }
+
+            ResultSetMetaData meta = rs.getMetaData();
+            ArrayNode columns = MAPPER.createArrayNode();
+            int columnCount = meta.getColumnCount();
+            for (int i = 1; i <= columnCount; i++) {
+                String label = meta.getColumnLabel(i);
+                columns.add(label == null || label.isBlank() ? meta.getColumnName(i) : label);
+            }
+            String sessionId = UUID.randomUUID().toString();
+            QuerySession session = new QuerySession(
+                sessionId,
+                statement,
+                rs,
+                meta,
+                columns,
+                maxRows,
+                start,
+                conn,
+                restoreAutoCommit
+            );
+            QUERY_SESSIONS.put(sessionId, session);
+            try {
+                return readQuerySessionPage(session, pageSize);
+            } catch (Exception | LinkageError error) {
+                QUERY_SESSIONS.remove(sessionId);
+                throw error;
+            }
+        } catch (Exception | LinkageError error) {
+            try {
+                statement.close();
+            } catch (Exception ignored) {
+            }
+            restorePagedQueryTransaction(conn, restoreAutoCommit);
+            throw error;
+        }
+    }
+
+    private static Statement createPagedQueryStatement(Connection connection) throws SQLException {
+        try {
+            return connection.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+        } catch (SQLFeatureNotSupportedException | UnsupportedOperationException | AbstractMethodError ignored) {
+            return connection.createStatement();
+        }
+    }
+
+    private static boolean beginPagedQueryTransaction(JsonNode connectionConfig, Connection connection)
+        throws SQLException {
+        if (!isPostgresConnection(connectionConfig) || !connection.getAutoCommit()) {
+            return false;
+        }
+        connection.setAutoCommit(false);
+        return true;
+    }
+
+    private static void restorePagedQueryTransaction(Connection connection, boolean restoreAutoCommit) {
+        if (!restoreAutoCommit) {
+            return;
+        }
+        try {
+            connection.rollback();
+        } catch (SQLException ignored) {
+        }
+        try {
+            connection.setAutoCommit(true);
+        } catch (SQLException ignored) {
+        }
+    }
+
+    private static JsonNode fetchQueryPage(String sessionId, int pageSize) throws SQLException {
+        QuerySession session = QUERY_SESSIONS.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Unknown query session: " + sessionId);
+        }
+        return readQuerySessionPage(session, pageSize);
+    }
+
+    private static JsonNode readQuerySessionPage(QuerySession session, int pageSize) throws SQLException {
+        int effectivePageSize = Math.max(1, pageSize);
+        ArrayNode rows = MAPPER.createArrayNode();
+        boolean truncated = false;
+
+        while (rows.size() < effectivePageSize && session.rowsReturned < session.maxRows) {
+            ArrayNode row;
+            if (session.pendingRow != null) {
+                row = session.pendingRow;
+                session.pendingRow = null;
+            } else {
+                if (!session.resultSet.next()) {
+                    closeQuerySession(session.id);
+                    return queryPageResult(session, rows, false, false);
+                }
+                row = readRow(session.resultSet, session.meta);
+            }
+            rows.add(row);
+            session.rowsReturned++;
+        }
+
+        if (session.rowsReturned >= session.maxRows) {
+            truncated = session.pendingRow != null || session.resultSet.next();
+            closeQuerySession(session.id);
+            return queryPageResult(session, rows, truncated, false);
+        }
+
+        boolean hasMore = session.resultSet.next();
+        if (!hasMore) {
+            closeQuerySession(session.id);
+            return queryPageResult(session, rows, false, false);
+        }
+
+        session.pendingRow = readRow(session.resultSet, session.meta);
+        return queryPageResult(session, rows, false, true);
+    }
+
+    private static ObjectNode queryPageResult(QuerySession session, ArrayNode rows, boolean truncated, boolean hasMore) {
+        ObjectNode result = MAPPER.createObjectNode();
+        result.set("columns", session.columns.deepCopy());
+        result.set("rows", rows);
+        result.put("affected_rows", 0);
+        result.put("execution_time_ms", (System.nanoTime() - session.startNanos) / 1_000_000);
+        result.put("truncated", truncated);
+        if (hasMore) {
+            result.put("session_id", session.id);
+        } else {
+            result.putNull("session_id");
+        }
+        result.put("has_more", hasMore);
+        return result;
+    }
+
+    private static ObjectNode closeQuerySessionResult(String sessionId) {
+        ObjectNode result = MAPPER.createObjectNode();
+        result.put("ok", closeQuerySession(sessionId));
+        return result;
+    }
+
+    private static boolean closeQuerySession(String sessionId) {
+        QuerySession session = QUERY_SESSIONS.remove(sessionId);
+        if (session == null) {
+            return false;
+        }
+        try {
+            session.resultSet.close();
+        } catch (Exception ignored) {
+        }
+        try {
+            session.statement.close();
+        } catch (Exception ignored) {
+        }
+        restorePagedQueryTransaction(session.connection, session.restoreAutoCommit);
+        return true;
+    }
+
+    private static void closeAllQuerySessions() {
+        List<String> sessionIds = new ArrayList<>(QUERY_SESSIONS.keySet());
+        for (String sessionId : sessionIds) {
+            closeQuerySession(sessionId);
+        }
+    }
+
+    private static ArrayNode readRow(ResultSet rs, ResultSetMetaData meta) throws SQLException {
+        ArrayNode row = MAPPER.createArrayNode();
+        for (int i = 1; i <= meta.getColumnCount(); i++) {
+            row.add(MAPPER.valueToTree(readValue(rs, meta, i)));
+        }
+        return row;
+    }
+
+    private static ExecutedStatement executeStatementForResult(
+        Statement statement,
+        String sql,
+        JdbcDriverQuirks quirks
+    ) throws SQLException {
+        if (quirks.preferExecuteQueryForResultSetSql() && looksLikeResultSetSql(sql)) {
+            return new ExecutedStatement(statement.executeQuery(sql), -1);
+        }
+        boolean hasResultSet = statement.execute(sql);
+        int updateCount = hasResultSet ? -1 : statement.getUpdateCount();
+        ResultSet rs = hasResultSet ? statement.getResultSet() : null;
+        if (rs == null && shouldRetryWithExecuteQuery(sql, hasResultSet, updateCount)) {
+            rs = statement.executeQuery(sql);
+        }
+        return new ExecutedStatement(rs, updateCount);
+    }
+
+    private static boolean shouldRetryWithExecuteQuery(String sql, boolean hasResultSet, int updateCount) {
+        if (hasResultSet) {
+            return true;
+        }
+        return updateCount < 0 && looksLikeResultSetSql(sql);
+    }
+
+    static boolean looksLikeResultSetSql(String sql) {
+        String keyword = firstSqlKeyword(sql);
+        return switch (keyword) {
+            case "SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "VALUES", "TABLE", "PRAGMA" -> true;
+            default -> false;
+        };
+    }
+
+    private static String firstSqlKeyword(String sql) {
+        String text = stripLeadingSqlComments(sql).trim();
+        int end = 0;
+        while (end < text.length() && Character.isLetter(text.charAt(end))) {
+            end++;
+        }
+        return text.substring(0, end).toUpperCase(Locale.ROOT);
+    }
+
+    private static String stripLeadingSqlComments(String sql) {
+        String text = sql.trim();
+        boolean changed;
+        do {
+            changed = false;
+            if (text.startsWith("--")) {
+                int lineEnd = text.indexOf('\n');
+                if (lineEnd < 0) {
+                    return "";
+                }
+                text = text.substring(lineEnd + 1).trim();
+                changed = true;
+            } else if (text.startsWith("/*")) {
+                int commentEnd = text.indexOf("*/", 2);
+                if (commentEnd < 0) {
+                    return "";
+                }
+                text = text.substring(commentEnd + 2).trim();
+                changed = true;
+            }
+        } while (changed);
+        return text;
     }
 
     /**
@@ -786,39 +1412,99 @@ public final class DbxJdbcPlugin {
         return result;
     }
 
-    private static JsonNode listTables(JsonNode connection, String database, String schema) throws SQLException {
+    private static JsonNode listTables(
+        JsonNode connection,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
         Connection conn = openConnection(connection);
         JdbcDriverQuirks quirks = driverQuirks(connection);
         if (quirks.useOracleMetadata()) {
-            return oracleListTables(conn, oracleEffectiveSchema(conn, schema));
+            return filterMetadataNodes(
+                (ArrayNode) oracleListTables(conn, oracleEffectiveSchema(conn, schema)),
+                filter,
+                limit,
+                offset,
+                objectTypes,
+                "table_type",
+                true
+            );
         }
-        String[] types = new String[] {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYSTEM TABLE", "SYSTEM VIEW"};
+        if (usePrestoInformationSchemaTables(connection)) {
+            return prestoListTables(conn, database, schema, filter, limit, offset, objectTypes);
+        }
+        if (isKingbaseUrl(optionalText(connection, "connection_string"))) {
+            return filterMetadataNodes(
+                (ArrayNode) kingbaseListTables(conn, schema, false),
+                filter,
+                limit,
+                offset,
+                objectTypes,
+                "table_type",
+                true
+            );
+        }
         DatabaseMetaData meta = conn.getMetaData();
+        String[] types = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
+        if (types.length == 0) {
+            return result;
+        }
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
         appendTables(result, meta, catalog, schemaPattern, types);
         if (result.isEmpty() && catalog != null) {
             appendTables(result, meta, null, schemaPattern, types);
         }
-        return result;
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "table_type", true);
     }
 
-    private static JsonNode listObjects(JsonNode connection, String database, String schema) throws SQLException {
+    private static JsonNode listObjects(
+        JsonNode connection,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
         Connection conn = openConnection(connection);
         if (driverQuirks(connection).useOracleMetadata()) {
-            return oracleListObjects(conn, oracleEffectiveSchema(conn, schema), schema);
+            return filterMetadataNodes(
+                (ArrayNode) oracleListObjects(conn, oracleEffectiveSchema(conn, schema), schema),
+                filter,
+                limit,
+                offset,
+                objectTypes,
+                "object_type",
+                false
+            );
+        }
+        if (usePrestoInformationSchemaTables(connection)) {
+            return prestoListObjects(conn, database, schema, filter, limit, offset, objectTypes);
+        }
+        boolean kingbase = isKingbaseUrl(optionalText(connection, "connection_string"));
+        if (kingbase) {
+            result.addAll((ArrayNode) kingbaseListTables(conn, schema, true));
         }
         DatabaseMetaData meta = conn.getMetaData();
         JdbcDriverQuirks quirks = driverQuirks(connection);
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
 
-        String[] tableTypes = new String[] {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYSTEM TABLE", "SYSTEM VIEW"};
-        appendTableObjects(result, meta, catalog, schemaPattern, schema, tableTypes);
-        if (result.isEmpty() && catalog != null) {
-            appendTableObjects(result, meta, null, schemaPattern, schema, tableTypes);
+        if (!kingbase) {
+            String[] tableTypes = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
+            if (tableTypes.length > 0) {
+                appendTableObjects(result, meta, catalog, schemaPattern, schema, tableTypes);
+                if (result.isEmpty() && catalog != null) {
+                    appendTableObjects(result, meta, null, schemaPattern, schema, tableTypes);
+                }
+            }
         }
 
         try (ResultSet rs = meta.getProcedures(catalog, schemaPattern, "%")) {
@@ -854,6 +1540,33 @@ public final class DbxJdbcPlugin {
         } catch (SQLException ignored) {
         }
 
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
+    }
+
+    private static JsonNode listDataTypes(JsonNode connection, String database) throws SQLException {
+        Connection conn = openConnection(connection);
+        JdbcDriverQuirks quirks = driverQuirks(connection);
+        String catalog = metadataCatalog(database, quirks);
+        if (catalog != null) {
+            try {
+                conn.setCatalog(catalog);
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
+            }
+        }
+        ArrayNode result = MAPPER.createArrayNode();
+        Set<String> seen = new HashSet<>();
+        try (ResultSet rs = conn.getMetaData().getTypeInfo()) {
+            while (rs.next()) {
+                String name = rs.getString("TYPE_NAME");
+                if (name == null || name.isBlank()) {
+                    continue;
+                }
+                String trimmed = name.trim();
+                if (seen.add(trimmed.toLowerCase(Locale.ROOT))) {
+                    result.add(trimmed);
+                }
+            }
+        }
         return result;
     }
 
@@ -862,6 +1575,12 @@ public final class DbxJdbcPlugin {
         Connection conn = openConnection(connection);
         if (driverQuirks(connection).useOracleMetadata()) {
             return oracleGetColumns(conn, oracleEffectiveSchema(conn, schema), table);
+        }
+        if (isKingbaseUrl(optionalText(connection, "connection_string"))) {
+            return kingbaseGetColumns(conn, schema, table);
+        }
+        if (usePrestoInformationSchemaTables(connection)) {
+            return prestoGetColumns(conn, database, schema, table);
         }
         DatabaseMetaData meta = conn.getMetaData();
         JdbcDriverQuirks quirks = driverQuirks(connection);
@@ -874,7 +1593,7 @@ public final class DbxJdbcPlugin {
             appendColumns(result, meta, null, schemaPattern, table, primaryKeys);
         }
         if (quirks.useCatalogFallbackSql()) {
-            mergeShowFullColumnComments(conn, result, schemaPattern, table);
+            mergeShowFullColumnMetadata(conn, result, schemaPattern, table);
         }
         return result;
     }
@@ -983,6 +1702,132 @@ public final class DbxJdbcPlugin {
         }
     }
 
+    static String[] jdbcTableTypes(DatabaseMetaData meta) throws SQLException {
+        Set<String> allowed = new HashSet<>();
+        for (String type : DEFAULT_TABLE_TYPES) {
+            allowed.add(type.toUpperCase(Locale.ROOT));
+        }
+        try (ResultSet rs = meta.getTableTypes()) {
+            List<String> types = new ArrayList<>();
+            while (rs.next()) {
+                String type = rs.getString("TABLE_TYPE");
+                if (type != null && allowed.contains(type.toUpperCase(Locale.ROOT))) {
+                    types.add(type);
+                }
+            }
+            if (!types.isEmpty()) {
+                return types.toArray(new String[0]);
+            }
+        } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {
+        }
+        return DEFAULT_TABLE_TYPES;
+    }
+
+    private static String[] constrainedJdbcTableTypes(String[] tableTypes, List<String> objectTypes) {
+        Set<String> allowed = normalizedObjectTypes(objectTypes);
+        if (allowed.isEmpty()) {
+            return tableTypes;
+        }
+        List<String> result = new ArrayList<>();
+        for (String tableType : tableTypes) {
+            if (allowed.contains(normalizeTableObjectType(tableType))) {
+                result.add(tableType);
+            }
+        }
+        return result.toArray(new String[0]);
+    }
+
+    private static ArrayNode filterMetadataNodes(
+        ArrayNode source,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes,
+        String typeField,
+        boolean defaultBlankTypeToTable
+    ) {
+        ArrayNode result = MAPPER.createArrayNode();
+        Set<String> allowedTypes = normalizedObjectTypes(objectTypes);
+        String normalizedFilter = filter == null ? "" : filter.trim().toLowerCase(Locale.ROOT);
+        int start = Math.max(0, offset);
+        int max = limit <= 0 ? Integer.MAX_VALUE : limit;
+        int skipped = 0;
+        for (JsonNode item : source) {
+            if (!metadataNameMatches(item.path("name").asText(""), normalizedFilter)) {
+                continue;
+            }
+            String type = item.path(typeField).asText("");
+            String normalizedType = defaultBlankTypeToTable ? normalizeTableObjectType(type) : normalizeObjectType(type);
+            if (!allowedTypes.isEmpty() && (normalizedType.isEmpty() || !allowedTypes.contains(normalizedType))) {
+                continue;
+            }
+            if (skipped++ < start) {
+                continue;
+            }
+            if (result.size() >= max) {
+                break;
+            }
+            result.add(item);
+        }
+        return result;
+    }
+
+    private static boolean metadataNameMatches(String name, String filter) {
+        if (filter == null || filter.isEmpty()) {
+            return true;
+        }
+        String candidate = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        return candidate.contains(filter) || (filter.length() >= 2 && fuzzySubsequenceMatches(candidate, filter));
+    }
+
+    private static boolean fuzzySubsequenceMatches(String candidate, String expected) {
+        int cursor = 0;
+        for (int i = 0; i < expected.length(); i++) {
+            cursor = candidate.indexOf(expected.charAt(i), cursor);
+            if (cursor < 0) {
+                return false;
+            }
+            cursor++;
+        }
+        return true;
+    }
+
+    private static Set<String> normalizedObjectTypes(List<String> objectTypes) {
+        Set<String> result = new HashSet<>();
+        if (objectTypes == null) {
+            return result;
+        }
+        for (String objectType : objectTypes) {
+            String normalized = normalizeObjectType(objectType);
+            if (!normalized.isEmpty()) {
+                result.add(normalized);
+            }
+        }
+        return result;
+    }
+
+    private static String normalizeTableObjectType(String value) {
+        String normalized = normalizeObjectType(value);
+        return normalized.isEmpty() ? "TABLE" : normalized;
+    }
+
+    private static String normalizeObjectType(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        String upper = value.trim().toUpperCase(Locale.ROOT).replace(' ', '_');
+        if (upper.contains("MATERIALIZED") && upper.contains("VIEW")) {
+            return "MATERIALIZED_VIEW";
+        }
+        if ("BASE_TABLE".equals(upper) || upper.contains("TABLE")) {
+            return "TABLE";
+        }
+        if (upper.contains("VIEW")) {
+            return "VIEW";
+        }
+        return upper;
+    }
+
     private static void appendTableObjects(
         ArrayNode result,
         DatabaseMetaData meta,
@@ -1003,6 +1848,438 @@ public final class DbxJdbcPlugin {
         }
     }
 
+    private static boolean usePrestoInformationSchemaTables(JsonNode connection) {
+        String url = optionalText(connection, "connection_string");
+        return urlMatchesPrefix(url, "jdbc:presto:") || urlMatchesPrefix(url, "jdbc:trino:");
+    }
+
+    private static JsonNode prestoListTables(
+        Connection conn,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        int queryLimit = limit > 0 ? Math.max(1, limit + Math.max(0, offset)) : 0;
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database, filter, queryLimit))) {
+            ps.setString(1, schema);
+            if (emptyToNull(filter) != null) {
+                ps.setString(2, escapeLikePattern(filter.toLowerCase(Locale.ROOT)) + "%");
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString(1));
+                    item.put("table_type", normalizeInformationSchemaTableType(rs.getString(2)));
+                    item.putNull("comment");
+                    result.add(item);
+                }
+            }
+        }
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "table_type", true);
+    }
+
+    private static JsonNode prestoListObjects(
+        Connection conn,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        int queryLimit = limit > 0 ? Math.max(1, limit + Math.max(0, offset)) : 0;
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database, filter, queryLimit))) {
+            ps.setString(1, schema);
+            if (emptyToNull(filter) != null) {
+                ps.setString(2, escapeLikePattern(filter.toLowerCase(Locale.ROOT)) + "%");
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString(1));
+                    item.put("object_type", normalizeInformationSchemaTableType(rs.getString(2)));
+                    putNullable(item, "schema", schema);
+                    item.putNull("comment");
+                    result.add(item);
+                }
+            }
+        }
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
+    }
+
+    private static JsonNode prestoGetColumns(Connection conn, String database, String schema, String table) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaColumnsSql(database))) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String dataType = rs.getString(2);
+                    ObjectNode item = columnNode(result, rs.getString(1));
+                    item.put("data_type", dataType);
+                    item.put("is_nullable", !"NO".equalsIgnoreCase(rs.getString(3)));
+                    putNullablePreferValue(item, "column_default", rs.getString(4));
+                    item.put("is_primary_key", false);
+                    item.putNull("extra");
+                    putNullablePreferValue(item, "comment", rs.getString(5));
+                    // Presto/Trino information_schema.columns does not expose precision/length fields.
+                    putNullableInt(item, "numeric_precision", prestoNumericPrecision(dataType));
+                    putNullableInt(item, "numeric_scale", prestoNumericScale(dataType));
+                    putNullableInt(item, "character_maximum_length", prestoCharacterMaximumLength(dataType));
+                }
+            }
+        }
+        return result;
+    }
+
+    static String prestoInformationSchemaTablesSql(String database, String filter, int limit) {
+        String source = emptyToNull(database) == null
+            ? "information_schema.tables"
+            : quoteAnsiIdentifier(database) + ".information_schema.tables";
+        StringBuilder sql = new StringBuilder("SELECT table_name, table_type FROM " + source +
+            " WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW')" +
+            (emptyToNull(filter) == null ? "" : " AND lower(table_name) LIKE ? ESCAPE '\\'") +
+            " ORDER BY table_type, table_name");
+        if (limit > 0) {
+            sql.append(" LIMIT ").append(limit);
+        }
+        return sql.toString();
+    }
+
+    static String prestoInformationSchemaColumnsSql(String database) {
+        String source = emptyToNull(database) == null
+            ? "information_schema.columns"
+            : quoteAnsiIdentifier(database) + ".information_schema.columns";
+        return "SELECT column_name, data_type, is_nullable, column_default, comment FROM " + source +
+            " WHERE table_schema = ? AND table_name = ?" +
+            " ORDER BY ordinal_position";
+    }
+
+    private static Integer prestoNumericPrecision(String dataType) {
+        return prestoTypeArgument(dataType, 0, "decimal", "numeric");
+    }
+
+    private static Integer prestoNumericScale(String dataType) {
+        return prestoTypeArgument(dataType, 1, "decimal", "numeric");
+    }
+
+    private static Integer prestoCharacterMaximumLength(String dataType) {
+        return prestoTypeArgument(dataType, 0, "char", "varchar");
+    }
+
+    private static Integer prestoTypeArgument(String dataType, int argumentIndex, String... typeNames) {
+        if (dataType == null) {
+            return null;
+        }
+        int open = dataType.indexOf('(');
+        int close = open < 0 ? -1 : dataType.indexOf(')', open + 1);
+        if (open <= 0 || close <= open) {
+            return null;
+        }
+        String name = dataType.substring(0, open).trim().toLowerCase(Locale.ROOT);
+        boolean matches = false;
+        for (String typeName : typeNames) {
+            if (typeName.equals(name)) {
+                matches = true;
+                break;
+            }
+        }
+        if (!matches) {
+            return null;
+        }
+        String[] arguments = dataType.substring(open + 1, close).split(",");
+        if (argumentIndex >= arguments.length) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(arguments[argumentIndex].trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    static String normalizeInformationSchemaTableType(String tableType) {
+        if (tableType == null) {
+            return "TABLE";
+        }
+        String normalized = tableType.trim().toUpperCase(Locale.ROOT).replace(' ', '_');
+        return switch (normalized) {
+            case "BASE_TABLE" -> "TABLE";
+            case "MATERIALIZED_VIEW" -> "MATERIALIZED_VIEW";
+            case "VIEW" -> "VIEW";
+            default -> tableType;
+        };
+    }
+
+    private static JsonNode kingbaseListTables(Connection conn, String schema, boolean objectNodes) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        String effectiveSchema = kingbaseEffectiveSchema(conn, schema);
+        KingbaseTableCatalogMode catalogMode = kingbaseTableCatalogMode(conn);
+        String sql = switch (catalogMode) {
+            case SYS_CATALOG -> kingbaseCastSafeTablesSql();
+            case POSTGRES_CATALOG -> kingbasePostgresTablesSql();
+            case INFORMATION_SCHEMA -> kingbaseCompatibilityTablesSql();
+        };
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, effectiveSchema);
+            if (catalogMode == KingbaseTableCatalogMode.SYS_CATALOG) {
+                ps.setString(2, effectiveSchema);
+                ps.setString(3, effectiveSchema);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String tableName = rs.getString("table_name");
+                    String tableType = normalizeInformationSchemaTableType(rs.getString("table_type"));
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", tableName);
+                    if (objectNodes) {
+                        item.put("object_type", tableType);
+                        item.put("schema", effectiveSchema);
+                    } else {
+                        item.put("table_type", tableType);
+                    }
+                    putNullable(item, "comment", rs.getString("remarks"));
+                    result.add(item);
+                }
+            }
+        }
+        return result;
+    }
+
+    private enum KingbaseTableCatalogMode {
+        SYS_CATALOG,
+        POSTGRES_CATALOG,
+        INFORMATION_SCHEMA
+    }
+
+    private static KingbaseTableCatalogMode kingbaseTableCatalogMode(Connection conn) {
+        if (!kingbaseCatalogExists(conn, "sys_catalog.sys_namespace")) {
+            return kingbaseCatalogExists(conn, "pg_catalog.pg_namespace")
+                ? KingbaseTableCatalogMode.POSTGRES_CATALOG
+                : KingbaseTableCatalogMode.INFORMATION_SCHEMA;
+        }
+        return kingbaseMysqlCompatibilityMode(conn)
+            ? KingbaseTableCatalogMode.INFORMATION_SCHEMA
+            : KingbaseTableCatalogMode.SYS_CATALOG;
+    }
+
+    private static boolean kingbaseMysqlCompatibilityMode(Connection conn) {
+        try (Statement statement = conn.createStatement();
+             ResultSet rs = statement.executeQuery(
+                 "SELECT setting FROM sys_catalog.sys_settings WHERE LOWER(name) = 'database_mode'"
+             )) {
+            if (rs.next()) {
+                return "mysql".equalsIgnoreCase(rs.getString(1));
+            }
+        } catch (Exception ignored) {
+            // Older Kingbase versions do not expose database_mode.
+        }
+        try (Statement statement = conn.createStatement();
+             ResultSet rs = statement.executeQuery(
+                 "SELECT 1 FROM sys_catalog.sys_settings WHERE LOWER(name) = 'sql_mode'"
+             )) {
+            return rs.next();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean kingbaseCatalogExists(Connection conn, String catalog) {
+        try (Statement statement = conn.createStatement();
+             ResultSet ignored = statement.executeQuery("SELECT 1 FROM " + catalog + " WHERE 1 = 0")) {
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static String kingbaseCompatibilityTablesSql() {
+        return """
+            SELECT CAST(table_name AS varchar(256)) AS table_name,
+                CASE UPPER(CAST(table_type AS varchar(64)))
+                    WHEN 'VIEW' THEN 'VIEW'
+                    WHEN 'MATERIALIZED VIEW' THEN 'MATERIALIZED_VIEW'
+                    ELSE 'TABLE'
+                END AS table_type,
+                NULL AS remarks
+            FROM information_schema.tables
+            WHERE CAST(table_schema AS varchar(256)) = ?
+                AND UPPER(CAST(table_type AS varchar(64))) IN ('BASE TABLE', 'TABLE', 'VIEW', 'MATERIALIZED VIEW')
+            ORDER BY CAST(table_name AS varchar(256))
+            """;
+    }
+
+    private static String kingbasePostgresTablesSql() {
+        return """
+            SELECT CAST(c.relname AS varchar(256)) AS table_name,
+                CASE c.relkind
+                    WHEN 'v' THEN 'VIEW'
+                    WHEN 'm' THEN 'MATERIALIZED_VIEW'
+                    WHEN 'f' THEN 'FOREIGN TABLE'
+                    ELSE 'TABLE'
+                END AS table_type,
+                CAST(obj_description(c.oid) AS varchar(4000)) AS remarks
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ?
+                AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+            ORDER BY c.relname
+            """;
+    }
+
+    private static String kingbaseCastSafeTablesSql() {
+        return """
+            SELECT table_name, table_type, remarks
+            FROM (
+                SELECT CAST(c.relname AS varchar(256)) AS table_name,
+                    'TABLE' AS table_type,
+                    CAST(d.description AS varchar(4000)) AS remarks
+                FROM sys_catalog.sys_class c
+                JOIN sys_catalog.sys_namespace n
+                    ON CAST(n.oid AS varchar(64)) = CAST(c.relnamespace AS varchar(64))
+                LEFT JOIN sys_catalog.sys_description d
+                    ON CAST(d.objoid AS varchar(64)) = CAST(c.oid AS varchar(64)) AND d.objsubid = 0
+                WHERE CAST(n.nspname AS varchar(256)) = ?
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM sys_catalog.sys_tables t
+                            WHERE CAST(t.schemaname AS varchar(256)) = CAST(n.nspname AS varchar(256))
+                                AND CAST(t.tablename AS varchar(256)) = CAST(c.relname AS varchar(256))
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM sys_catalog.sys_foreign_table ft
+                            WHERE CAST(ft.ftrelid AS varchar(64)) = CAST(c.oid AS varchar(64))
+                        )
+                    )
+                UNION ALL
+                SELECT CAST(v.viewname AS varchar(256)) AS table_name,
+                    'VIEW' AS table_type,
+                    CAST(d.description AS varchar(4000)) AS remarks
+                FROM sys_catalog.sys_views v
+                JOIN sys_catalog.sys_namespace n
+                    ON CAST(n.nspname AS varchar(256)) = CAST(v.schemaname AS varchar(256))
+                JOIN sys_catalog.sys_class c
+                    ON CAST(c.relnamespace AS varchar(64)) = CAST(n.oid AS varchar(64))
+                    AND CAST(c.relname AS varchar(256)) = CAST(v.viewname AS varchar(256))
+                LEFT JOIN sys_catalog.sys_description d
+                    ON CAST(d.objoid AS varchar(64)) = CAST(c.oid AS varchar(64)) AND d.objsubid = 0
+                WHERE CAST(v.schemaname AS varchar(256)) = ?
+                UNION ALL
+                SELECT CAST(mv.matviewname AS varchar(256)) AS table_name,
+                    'MATERIALIZED_VIEW' AS table_type,
+                    CAST(d.description AS varchar(4000)) AS remarks
+                FROM sys_catalog.sys_matviews mv
+                JOIN sys_catalog.sys_namespace n
+                    ON CAST(n.nspname AS varchar(256)) = CAST(mv.schemaname AS varchar(256))
+                JOIN sys_catalog.sys_class c
+                    ON CAST(c.relnamespace AS varchar(64)) = CAST(n.oid AS varchar(64))
+                    AND CAST(c.relname AS varchar(256)) = CAST(mv.matviewname AS varchar(256))
+                LEFT JOIN sys_catalog.sys_description d
+                    ON CAST(d.objoid AS varchar(64)) = CAST(c.oid AS varchar(64)) AND d.objsubid = 0
+                WHERE CAST(mv.schemaname AS varchar(256)) = ?
+            ) metadata_tables
+            ORDER BY table_name
+            """;
+    }
+
+    private static String kingbaseEffectiveSchema(Connection conn, String schema) {
+        String effectiveSchema = emptyToNull(schema);
+        if (effectiveSchema != null) {
+            return effectiveSchema;
+        }
+        try {
+            effectiveSchema = emptyToNull(conn.getSchema());
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+        }
+        return effectiveSchema == null ? "PUBLIC" : effectiveSchema;
+    }
+
+    private static JsonNode kingbaseGetColumns(Connection conn, String schema, String table) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        String effectiveSchema = kingbaseEffectiveSchema(conn, schema);
+        Set<String> primaryKeys = kingbasePrimaryKeys(conn, effectiveSchema, table);
+        String sql = "SELECT a.attname AS column_name, " +
+            "format_type(a.atttypid, a.atttypmod) AS data_type, " +
+            "NOT a.attnotnull AS is_nullable, " +
+            "sys_get_expr(ad.adbin, ad.adrelid) AS column_default, " +
+            "d.description AS column_comment, " +
+            "CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 " +
+            "THEN ((a.atttypmod - 4) >> 16) & 65535 ELSE NULL END AS numeric_precision, " +
+            "CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 " +
+            "THEN (a.atttypmod - 4) & 65535 ELSE NULL END AS numeric_scale, " +
+            "CASE WHEN t.typname IN ('varchar', 'bpchar') AND a.atttypmod > 0 " +
+            "THEN a.atttypmod - 4 ELSE NULL END AS character_maximum_length " +
+            "FROM sys_catalog.sys_attribute a " +
+            "JOIN sys_catalog.sys_type t ON t.oid = a.atttypid " +
+            "JOIN sys_catalog.sys_class c ON c.oid = a.attrelid " +
+            "JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace " +
+            "LEFT JOIN sys_catalog.sys_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum " +
+            "LEFT JOIN sys_catalog.sys_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum " +
+            "WHERE n.nspname = " + sqlString(effectiveSchema) +
+            " AND c.relname = " + sqlString(table) + " " +
+            "AND a.attnum > 0 AND NOT a.attisdropped " +
+            "ORDER BY a.attnum";
+        try (Statement statement = conn.createStatement()) {
+            try (ResultSet rs = statement.executeQuery(sql)) {
+                while (rs.next()) {
+                    String name = rs.getString("column_name");
+                    ObjectNode item = columnNode(result, name);
+                    item.put("data_type", rs.getString("data_type"));
+                    item.put("is_nullable", rs.getBoolean("is_nullable"));
+                    putNullablePreferValue(item, "column_default", rs.getString("column_default"));
+                    item.put("is_primary_key", primaryKeys.contains(name));
+                    item.putNull("extra");
+                    putNullablePreferValue(item, "comment", rs.getString("column_comment"));
+                    putNullableInt(item, "numeric_precision", rs.getObject("numeric_precision"));
+                    putNullableInt(item, "numeric_scale", rs.getObject("numeric_scale"));
+                    putNullableInt(item, "character_maximum_length", rs.getObject("character_maximum_length"));
+                }
+            }
+        }
+        return result;
+    }
+
+    private static Set<String> kingbasePrimaryKeys(Connection conn, String schema, String table) {
+        Set<String> primaryKeys = new HashSet<>();
+        String sql = "SELECT a.attname AS column_name " +
+            "FROM sys_catalog.sys_constraint co " +
+            "JOIN sys_catalog.sys_class c ON c.oid = co.conrelid " +
+            "JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace " +
+            "JOIN LATERAL (SELECT unnest(co.conkey) AS attnum, generate_series(1, array_length(co.conkey, 1)) AS ord) AS pk_cols ON true " +
+            "JOIN sys_catalog.sys_attribute a ON a.attrelid = c.oid AND a.attnum = pk_cols.attnum " +
+            "WHERE co.contype = 'p' " +
+            "AND n.nspname = " + sqlString(schema) + " " +
+            "AND c.relname = " + sqlString(table) + " " +
+            "ORDER BY pk_cols.ord";
+        try (Statement statement = conn.createStatement()) {
+            try (ResultSet rs = statement.executeQuery(sql)) {
+                while (rs.next()) {
+                    primaryKeys.add(rs.getString("column_name"));
+                }
+            }
+        } catch (SQLException ignored) {
+            return Collections.emptySet();
+        }
+        return primaryKeys;
+    }
+
+    private static boolean isKingbaseUrl(String url) {
+        return urlMatchesPrefix(url, "jdbc:kingbase");
+    }
+
+    private static String quoteAnsiIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String sqlString(String value) {
+        return "'" + (value == null ? "" : value).replace("'", "''") + "'";
+    }
+
     private static void appendColumns(
         ArrayNode result,
         DatabaseMetaData meta,
@@ -1016,7 +2293,7 @@ public final class DbxJdbcPlugin {
                 String name = rs.getString("COLUMN_NAME");
                 ObjectNode item = columnNode(result, name);
                 item.put("data_type", rs.getString("TYPE_NAME"));
-                item.put("is_nullable", rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls);
+                item.put("is_nullable", columnIsNullable(rs));
                 putNullablePreferValue(item, "column_default", rs.getString("COLUMN_DEF"));
                 item.put("is_primary_key", primaryKeys.contains(name));
                 item.putNull("extra");
@@ -1028,19 +2305,43 @@ public final class DbxJdbcPlugin {
         }
     }
 
-    private static void mergeShowFullColumnComments(Connection conn, ArrayNode result, String schema, String table) {
+    private static boolean columnIsNullable(ResultSet rs) throws SQLException {
+        try {
+            String isNullableStr = rs.getString("IS_NULLABLE");
+            if ("YES".equalsIgnoreCase(isNullableStr)) {
+                return true;
+            }
+            if ("NO".equalsIgnoreCase(isNullableStr)) {
+                return false;
+            }
+        } catch (SQLException ignored) {
+        }
+        return rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
+    }
+
+    private static void mergeShowFullColumnMetadata(Connection conn, ArrayNode result, String schema, String table) {
         String target = qualifiedJdbcTableName(schema, table);
         try (Statement statement = conn.createStatement(); ResultSet rs = statement.executeQuery("SHOW FULL COLUMNS FROM " + target)) {
             int fieldIndex = resultSetColumnIndex(rs, "Field");
+            int typeIndex = resultSetColumnIndex(rs, "Type");
+            int extraIndex = resultSetColumnIndex(rs, "Extra");
             int commentIndex = resultSetColumnIndex(rs, "Comment");
-            if (fieldIndex <= 0 || commentIndex <= 0) {
+            if (fieldIndex <= 0) {
                 return;
             }
             while (rs.next()) {
                 String name = rs.getString(fieldIndex);
-                String comment = rs.getString(commentIndex);
                 if (name != null) {
-                    putNullablePreferValue(columnNode(result, name), "comment", comment);
+                    ObjectNode item = columnNode(result, name);
+                    if (typeIndex > 0) {
+                        putNullablePreferValue(item, "data_type", rs.getString(typeIndex));
+                    }
+                    if (extraIndex > 0) {
+                        putNullablePreferValue(item, "extra", rs.getString(extraIndex));
+                    }
+                    if (commentIndex > 0) {
+                        putNullablePreferValue(item, "comment", rs.getString(commentIndex));
+                    }
                 }
             }
         } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
@@ -1064,6 +2365,7 @@ public final class DbxJdbcPlugin {
     }
 
     private static void closeSharedConnection() {
+        closeAllQuerySessions();
         if (sharedConnection != null) {
             try {
                 sharedConnection.close();
@@ -1079,11 +2381,16 @@ public final class DbxJdbcPlugin {
     }
 
     private static String connectionKey(JsonNode connection) {
-        return optionalText(connection, "connection_string")
+        String connectionString = optionalText(connection, "connection_string");
+        String jdbcxSecurityKey = isJdbcxUrl(connectionString)
+            ? "|jdbcxHighPrivilegeExtensions=" + jdbcxHighPrivilegeExtensionsEnabled(connection)
+            : "";
+        return connectionString
             + "|" + optionalText(connection, "url_params")
             + "|" + optionalText(connection, "username")
             + "|" + optionalText(connection, "password")
-            + "|" + connection.path("sysdba").asBoolean(false);
+            + "|" + connection.path("sysdba").asBoolean(false)
+            + jdbcxSecurityKey;
     }
 
     private static Set<String> primaryKeys(DatabaseMetaData meta, String database, String schema, String table) throws SQLException {
@@ -1125,11 +2432,96 @@ public final class DbxJdbcPlugin {
         return jdbcUrlWithPasswordKey(url, optionalText(connection, "password"));
     }
 
+    private record JdbcUrlCredentials(String url, String username, String password) {}
+
+    static JdbcUrlCredentials extractJdbcUrlCredentials(String url) {
+        if (url == null) {
+            return new JdbcUrlCredentials(null, null, null);
+        }
+        int queryStart = url.indexOf('?');
+        if (queryStart < 0) {
+            return new JdbcUrlCredentials(url, null, null);
+        }
+
+        int fragmentStart = url.indexOf('#', queryStart + 1);
+        String base = url.substring(0, queryStart);
+        String query = fragmentStart < 0 ? url.substring(queryStart + 1) : url.substring(queryStart + 1, fragmentStart);
+        String fragment = fragmentStart < 0 ? "" : url.substring(fragmentStart);
+
+        String username = null;
+        String password = null;
+        boolean foundCredential = false;
+        List<String> keptParams = new ArrayList<>();
+        for (String part : splitJdbcUrlParams(query)) {
+            String name = partName(part);
+            String key = decodeQueryPart(name).trim().toLowerCase(Locale.ROOT);
+            if ("user".equals(key)) {
+                username = decodeQueryPart(partValue(part));
+                foundCredential = true;
+            } else if ("password".equals(key)) {
+                password = decodeQueryPart(partValue(part));
+                foundCredential = true;
+            } else {
+                keptParams.add(part);
+            }
+        }
+
+        if (!foundCredential) {
+            return new JdbcUrlCredentials(url, null, null);
+        }
+        String sanitizedQuery = joinJdbcUrlParams(keptParams);
+        String sanitizedUrl = sanitizedQuery.isEmpty() ? base + fragment : base + "?" + sanitizedQuery + fragment;
+        return new JdbcUrlCredentials(sanitizedUrl, username, password);
+    }
+
+    private static List<String> splitJdbcUrlParams(String query) {
+        List<String> result = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i < query.length(); i++) {
+            char ch = query.charAt(i);
+            if (ch == '&') {
+                result.add(query.substring(start, i));
+                start = i + 1;
+            }
+        }
+        result.add(query.substring(start));
+        return result;
+    }
+
+    private static String joinJdbcUrlParams(List<String> params) {
+        return params.stream().filter(param -> !param.isEmpty()).collect(Collectors.joining("&"));
+    }
+
+    private static String partName(String part) {
+        int equals = part.indexOf('=');
+        return equals < 0 ? part : part.substring(0, equals);
+    }
+
+    private static String partValue(String part) {
+        int equals = part.indexOf('=');
+        return equals < 0 ? "" : part.substring(equals + 1);
+    }
+
+    private static String decodeQueryPart(String value) {
+        try {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException ignored) {
+            return value;
+        }
+    }
+
     private static boolean isSqliteUrl(String url) {
         return url.regionMatches(true, 0, "jdbc:sqlite:", 0, 12);
     }
 
     private static boolean urlHasQueryParam(String url, String key) {
+        return jdbcUrlHasParameter(url, key);
+    }
+
+    private static boolean jdbcUrlHasParameter(String url, String key) {
+        if (url == null) {
+            return false;
+        }
         int queryStart = url.indexOf('?');
         if (queryStart < 0) {
             return false;
@@ -1178,7 +2570,7 @@ public final class DbxJdbcPlugin {
     }
 
     private static String jdbcUrlParamSeparator(String base) {
-        if (urlMatchesPrefix(base, "jdbc:sqlserver:")) {
+        if (urlMatchesPrefix(base, "jdbc:sqlserver:") || urlMatchesPrefix(base, "jdbc:dremio:")) {
             return base.endsWith(";") ? "" : ";";
         }
         if (jdbcUrlUsesColonProperties(base)) {
@@ -1475,6 +2867,10 @@ public final class DbxJdbcPlugin {
             byte[] bytes = rs.getBytes(index);
             return bytes == null ? null : binaryToHex(bytes);
         }
+        Object temporalValue = readTemporalValue(rs, meta, index);
+        if (temporalValue != null) {
+            return temporalValue;
+        }
         if (value instanceof Date || value instanceof Time || value instanceof Timestamp || value instanceof TemporalAccessor) {
             return value.toString();
         }
@@ -1485,6 +2881,24 @@ public final class DbxJdbcPlugin {
             return value;
         }
         return value.toString();
+    }
+
+    private static Object readTemporalValue(ResultSet rs, ResultSetMetaData meta, int index) throws SQLException {
+        return switch (meta.getColumnType(index)) {
+            case Types.DATE -> {
+                Date date = rs.getDate(index);
+                yield date == null ? null : date.toString();
+            }
+            case Types.TIME -> {
+                Time time = rs.getTime(index);
+                yield time == null ? null : time.toString();
+            }
+            case Types.TIMESTAMP -> {
+                Timestamp timestamp = rs.getTimestamp(index);
+                yield timestamp == null ? null : timestamp.toString();
+            }
+            default -> null;
+        };
     }
 
     private static boolean isBinaryColumn(ResultSetMetaData meta, int index) throws SQLException {
@@ -1562,6 +2976,34 @@ public final class DbxJdbcPlugin {
         return text.isEmpty() ? null : text;
     }
 
+    private static List<String> optionalStringList(JsonNode node, String field) {
+        JsonNode value = node.path(field);
+        if (value.isMissingNode() || value.isNull()) {
+            return null;
+        }
+        List<String> result = new ArrayList<>();
+        if (value.isArray()) {
+            for (JsonNode item : value) {
+                String text = item.asText("").trim();
+                if (!text.isEmpty()) {
+                    result.add(text);
+                }
+            }
+            return result;
+        }
+        String text = value.asText("").trim();
+        if (text.isEmpty()) {
+            return null;
+        }
+        for (String part : text.split(",")) {
+            String item = part.trim();
+            if (!item.isEmpty()) {
+                result.add(item);
+            }
+        }
+        return result;
+    }
+
     private static int positiveInt(JsonNode node, String field, int defaultValue) {
         return Math.max(1, nonNegativeInt(node, field, defaultValue));
     }
@@ -1579,6 +3021,10 @@ public final class DbxJdbcPlugin {
 
     private static String emptyToNull(String value) {
         return value == null || value.isBlank() ? null : value;
+    }
+
+    private static String escapeLikePattern(String value) {
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
     }
 
     private static Path expandHome(String path) {

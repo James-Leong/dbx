@@ -13,7 +13,7 @@ import {
   transposeFieldWidth,
   transposeScrollLeftForRecord,
   visibleTransposeRecordWindow,
-} from "../../apps/desktop/src/lib/dataGridTranspose.ts";
+} from "../../apps/desktop/src/lib/dataGrid/dataGridTranspose.ts";
 
 test("row number double click opens transpose for a row", () => {
   assert.deepEqual(nextTransposeState(false, null, 2), {
@@ -36,7 +36,7 @@ test("row number double click closes transpose for the same row", () => {
   });
 });
 
-test("context menu transpose closes when invoked for the current anchor row", () => {
+test("context menu transpose keeps the requested row when multiple rows are selected", () => {
   assert.deepEqual(
     nextContextTransposeState({
       showTranspose: true,
@@ -47,8 +47,8 @@ test("context menu transpose closes when invoked for the current anchor row", ()
       selectedRange: null,
     }),
     {
-      showTranspose: false,
-      transposeRowIndex: null,
+      showTranspose: true,
+      transposeRowIndex: 3,
     },
   );
 });
@@ -256,15 +256,15 @@ test("calculates a horizontal record window with spacer widths", () => {
       overscan: 1,
     }),
     {
-      start: 1,
-      end: 7,
-      beforeWidth: 160,
-      afterWidth: 14880,
+      start: 3,
+      end: 9,
+      beforeWidth: 480,
+      afterWidth: 14560,
     },
   );
 });
 
-test("uses the first selected row as the transpose anchor when context row is inside row selection", () => {
+test("keeps the requested row as the transpose anchor when context row is inside row selection", () => {
   assert.equal(
     transposeAnchorRowIndex({
       requestedRowIndex: 3,
@@ -272,11 +272,11 @@ test("uses the first selected row as the transpose anchor when context row is in
       selectedRowIds: new Set([12, 13, 14]),
       selectedRange: null,
     }),
-    2,
+    3,
   );
 });
 
-test("uses the first selected cell range row as the transpose anchor when context row is inside range", () => {
+test("keeps the requested row as the transpose anchor when context row is inside range", () => {
   assert.equal(
     transposeAnchorRowIndex({
       requestedRowIndex: 5,
@@ -284,13 +284,13 @@ test("uses the first selected cell range row as the transpose anchor when contex
       selectedRowIds: new Set(),
       selectedRange: { startRow: 2, endRow: 5, startCol: 0, endCol: 2 },
     }),
-    2,
+    5,
   );
 });
 
 test("sizes the transpose field column from visible field names", () => {
   assert.equal(transposeFieldWidth(["id", "iso3", "year"]), 104);
-  assert.equal(transposeFieldWidth(["country_name"]), 128);
+  assert.equal(transposeFieldWidth(["country_name"]), 124);
 });
 
 test("caps the transpose field column width for long field names", () => {

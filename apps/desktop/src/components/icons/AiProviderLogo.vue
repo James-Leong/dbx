@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import { Settings2 } from "@lucide/vue";
 import type { AiProvider } from "@/stores/settingsStore";
 import { useTheme } from "@/composables/useTheme";
+import { webPath } from "@/lib/common/webPath";
 
 const props = defineProps<{
   provider: AiProvider;
@@ -20,16 +21,10 @@ watch(
   },
 );
 
-const usesWhiteDarkIcon = computed(
-  () =>
-    props.provider === "claude" ||
-    props.provider === "ollama" ||
-    props.provider === "openai" ||
-    props.provider === "openai-compatible",
-);
+const usesWhiteDarkIcon = computed(() => props.provider === "claude" || props.provider === "anthropic-compatible" || props.provider === "ollama" || props.provider === "openai" || props.provider === "openai-compatible");
 const localIconUrl = computed(() => {
-  if (props.provider === "openai-compatible") return "/icons/ai/openai.svg";
-  return props.iconSlug ? `/icons/ai/${props.iconSlug}.svg` : "";
+  if (props.provider === "openai-compatible") return webPath("/icons/ai/openai.svg");
+  return props.iconSlug ? webPath(`/icons/ai/${props.iconSlug}.svg`) : "";
 });
 const fallbackText = computed(() => {
   if (props.provider === "openai-compatible") return "OC";
@@ -40,14 +35,7 @@ const fallbackText = computed(() => {
 <template>
   <span class="flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden rounded-sm">
     <Settings2 v-if="provider === 'custom'" class="h-4 w-4 text-muted-foreground" />
-    <img
-      v-else-if="localIconUrl && !failed"
-      :src="localIconUrl"
-      :alt="label"
-      class="h-4 w-4 object-contain"
-      :class="{ 'dark:invert': isDark && usesWhiteDarkIcon }"
-      @error="failed = true"
-    />
+    <img v-else-if="localIconUrl && !failed" :src="localIconUrl" :alt="label" class="h-4 w-4 object-contain" :class="{ 'dark:invert': isDark && usesWhiteDarkIcon }" @error="failed = true" />
     <span v-else class="flex h-4 w-4 items-center justify-center rounded-sm bg-muted text-[8px] font-semibold">
       {{ fallbackText }}
     </span>

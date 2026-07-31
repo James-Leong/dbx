@@ -10,6 +10,7 @@ const showDataCompareDialog = ref(false);
 const showSqlFileDialog = ref(false);
 const showDiagramDialog = ref(false);
 const showTableImportDialog = ref(false);
+const showTableDataGenerateDialog = ref(false);
 const showFieldLineageDialog = ref(false);
 const showDatabaseSearchDialog = ref(false);
 const showDatabaseExportDialog = ref(false);
@@ -22,6 +23,12 @@ const pendingImportContent = ref("");
 
 const transferPrefillConnectionId = ref("");
 const transferPrefillDatabase = ref("");
+const transferPrefillCatalog = ref("");
+const transferPrefillSchema = ref("");
+const transferPrefillTables = ref<string[]>([]);
+const transferPrefillTargetConnectionId = ref("");
+const transferPrefillTargetDatabase = ref("");
+const transferPrefillTargetSchema = ref("");
 const schemaDiffPrefillConnectionId = ref("");
 const schemaDiffPrefillDatabase = ref("");
 const schemaDiffPrefillSchema = ref("");
@@ -31,6 +38,7 @@ const dataComparePrefillSchema = ref("");
 const dataComparePrefillTable = ref("");
 const sqlFilePrefillConnectionId = ref("");
 const sqlFilePrefillDatabase = ref("");
+const sqlFilePrefillFilePath = ref("");
 const diagramPrefillConnectionId = ref("");
 const diagramPrefillDatabase = ref("");
 const diagramPrefillSchema = ref("");
@@ -39,6 +47,10 @@ const tableImportPrefillConnectionId = ref("");
 const tableImportPrefillDatabase = ref("");
 const tableImportPrefillSchema = ref("");
 const tableImportPrefillTable = ref("");
+const tableDataGeneratePrefillConnectionId = ref("");
+const tableDataGeneratePrefillDatabase = ref("");
+const tableDataGeneratePrefillSchema = ref("");
+const tableDataGeneratePrefillTable = ref("");
 const lineagePrefillConnectionId = ref("");
 const lineagePrefillDatabase = ref("");
 const lineagePrefillSchema = ref("");
@@ -52,8 +64,20 @@ const databaseExportPrefillDatabase = ref("");
 const databaseExportPrefillSchema = ref("");
 const databaseExportPrefillTable = ref("");
 const databaseExportPrefillTables = ref<string[]>([]);
+const databaseExportAllDatabases = ref(false);
 
 let watchersRegistered = false;
+
+function clearTransferPrefill() {
+  transferPrefillConnectionId.value = "";
+  transferPrefillDatabase.value = "";
+  transferPrefillCatalog.value = "";
+  transferPrefillSchema.value = "";
+  transferPrefillTables.value = [];
+  transferPrefillTargetConnectionId.value = "";
+  transferPrefillTargetDatabase.value = "";
+  transferPrefillTargetSchema.value = "";
+}
 
 export function useDialogSources() {
   const { t } = useI18n();
@@ -70,11 +94,21 @@ export function useDialogSources() {
         if (v) {
           transferPrefillConnectionId.value = v.connectionId;
           transferPrefillDatabase.value = v.database;
+          transferPrefillCatalog.value = v.catalog ?? "";
+          transferPrefillSchema.value = v.schema ?? "";
+          transferPrefillTables.value = v.tables ?? [];
+          transferPrefillTargetConnectionId.value = v.targetConnectionId ?? "";
+          transferPrefillTargetDatabase.value = v.targetDatabase ?? "";
+          transferPrefillTargetSchema.value = v.targetSchema ?? "";
           showTransferDialog.value = true;
           connectionStore.transferSource = null;
         }
       },
     );
+
+    watch(showTransferDialog, (open) => {
+      if (!open) clearTransferPrefill();
+    });
 
     watch(
       () => connectionStore.schemaDiffSource,
@@ -109,11 +143,21 @@ export function useDialogSources() {
         if (v) {
           sqlFilePrefillConnectionId.value = v.connectionId;
           sqlFilePrefillDatabase.value = v.database;
+          sqlFilePrefillFilePath.value = v.filePath ?? "";
           showSqlFileDialog.value = true;
           connectionStore.sqlFileSource = null;
         }
       },
     );
+
+    // Clear the pre-filled file path once the dialog closes so a later open
+    // via the toolbar (which doesn't go through sqlFileSource) doesn't re-load
+    // the previously previewed file. prefillConnectionId/database are harmless
+    // when stale (they only preselect dropdowns), but a stale path triggers an
+    // async file read + preview render — a visible side effect.
+    watch(showSqlFileDialog, (open) => {
+      if (!open) sqlFilePrefillFilePath.value = "";
+    });
 
     watch(
       () => connectionStore.diagramSource,
@@ -136,9 +180,23 @@ export function useDialogSources() {
           tableImportPrefillConnectionId.value = v.connectionId;
           tableImportPrefillDatabase.value = v.database;
           tableImportPrefillSchema.value = v.schema ?? "";
-          tableImportPrefillTable.value = v.tableName;
+          tableImportPrefillTable.value = v.tableName ?? "";
           showTableImportDialog.value = true;
           connectionStore.tableImportSource = null;
+        }
+      },
+    );
+
+    watch(
+      () => connectionStore.tableDataGenerateSource,
+      (v) => {
+        if (v) {
+          tableDataGeneratePrefillConnectionId.value = v.connectionId;
+          tableDataGeneratePrefillDatabase.value = v.database;
+          tableDataGeneratePrefillSchema.value = v.schema ?? "";
+          tableDataGeneratePrefillTable.value = v.tableName;
+          showTableDataGenerateDialog.value = true;
+          connectionStore.tableDataGenerateSource = null;
         }
       },
     );
@@ -180,6 +238,7 @@ export function useDialogSources() {
           databaseExportPrefillSchema.value = v.schema ?? "";
           databaseExportPrefillTable.value = v.tableName ?? "";
           databaseExportPrefillTables.value = v.tableNames ?? [];
+          databaseExportAllDatabases.value = v.allDatabases ?? false;
           showDatabaseExportDialog.value = true;
           connectionStore.databaseExportSource = null;
         }
@@ -200,8 +259,7 @@ export function useDialogSources() {
       showConfigPassphraseDialog.value = false;
       toast(t("configExport.exportSuccess"), 2000);
     } catch (e: any) {
-      configPassphraseError.value =
-        e?.message === "crypto_unavailable" ? t("configExport.cryptoUnavailable") : e?.message || String(e);
+      configPassphraseError.value = e?.message === "crypto_unavailable" ? t("configExport.cryptoUnavailable") : e?.message || String(e);
     }
   }
 
@@ -253,12 +311,7 @@ export function useDialogSources() {
         showImportLayoutConfirm.value = true;
       }
     } catch (e: any) {
-      configPassphraseError.value =
-        e?.message === "wrong_passphrase"
-          ? t("configExport.wrongPassphrase")
-          : e?.message === "crypto_unavailable"
-            ? t("configExport.cryptoUnavailable")
-            : e?.message || String(e);
+      configPassphraseError.value = e?.message === "wrong_passphrase" ? t("configExport.wrongPassphrase") : e?.message === "crypto_unavailable" ? t("configExport.cryptoUnavailable") : e?.message || String(e);
     }
   }
 
@@ -269,6 +322,7 @@ export function useDialogSources() {
     showSqlFileDialog,
     showDiagramDialog,
     showTableImportDialog,
+    showTableDataGenerateDialog,
     showFieldLineageDialog,
     showDatabaseSearchDialog,
     showDatabaseExportDialog,
@@ -280,6 +334,12 @@ export function useDialogSources() {
     pendingImportContent,
     transferPrefillConnectionId,
     transferPrefillDatabase,
+    transferPrefillCatalog,
+    transferPrefillSchema,
+    transferPrefillTables,
+    transferPrefillTargetConnectionId,
+    transferPrefillTargetDatabase,
+    transferPrefillTargetSchema,
     schemaDiffPrefillConnectionId,
     schemaDiffPrefillDatabase,
     schemaDiffPrefillSchema,
@@ -289,6 +349,7 @@ export function useDialogSources() {
     dataComparePrefillTable,
     sqlFilePrefillConnectionId,
     sqlFilePrefillDatabase,
+    sqlFilePrefillFilePath,
     diagramPrefillConnectionId,
     diagramPrefillDatabase,
     diagramPrefillSchema,
@@ -297,6 +358,10 @@ export function useDialogSources() {
     tableImportPrefillDatabase,
     tableImportPrefillSchema,
     tableImportPrefillTable,
+    tableDataGeneratePrefillConnectionId,
+    tableDataGeneratePrefillDatabase,
+    tableDataGeneratePrefillSchema,
+    tableDataGeneratePrefillTable,
     lineagePrefillConnectionId,
     lineagePrefillDatabase,
     lineagePrefillSchema,
@@ -310,6 +375,7 @@ export function useDialogSources() {
     databaseExportPrefillSchema,
     databaseExportPrefillTable,
     databaseExportPrefillTables,
+    databaseExportAllDatabases,
     onExportClick,
     onExportConfirm,
     onImportClick,
